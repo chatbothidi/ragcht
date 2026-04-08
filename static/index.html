@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Medical & Event RAG Chatbot</title>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: 'Pretendard', -apple-system, sans-serif; background: #f5f5f5; height: 100vh; display: flex; flex-direction: column; }
+
+.header { background: #1a1a2e; color: white; padding: 16px 24px; display: flex; align-items: center; gap: 12px; }
+.header h1 { font-size: 18px; font-weight: 600; }
+.header .badge { font-size: 11px; background: #16213e; padding: 4px 10px; border-radius: 12px; color: #a8b2d1; }
+
+.filter-bar { background: white; padding: 10px 24px; border-bottom: 1px solid #e0e0e0; display: flex; gap: 8px; align-items: center; }
+.filter-bar label { font-size: 13px; color: #666; }
+.filter-bar select { padding: 6px 12px; border: 1px solid #ddd; border-radius: 6px; font-size: 13px; outline: none; }
+
+.chat-container { flex: 1; overflow-y: auto; padding: 24px; display: flex; flex-direction: column; gap: 16px; }
+
+.message { max-width: 75%; padding: 14px 18px; border-radius: 16px; font-size: 14px; line-height: 1.7; word-break: break-word; }
+.message.user { align-self: flex-end; background: #1a1a2e; color: white; border-bottom-right-radius: 4px; }
+.message.assistant { align-self: flex-start; background: white; color: #333; border-bottom-left-radius: 4px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+
+.message.assistant h1, .message.assistant h2, .message.assistant h3 { margin: 8px 0 4px; font-size: 15px; }
+.message.assistant p { margin: 4px 0; }
+.message.assistant ul, .message.assistant ol { margin: 4px 0 4px 20px; }
+.message.assistant li { margin: 2px 0; }
+.message.assistant strong { font-weight: 600; }
+.message.assistant code { background: #f0f0f0; padding: 1px 5px; border-radius: 3px; font-size: 13px; }
+.message.assistant pre { background: #f5f5f5; padding: 10px; border-radius: 6px; overflow-x: auto; margin: 6px 0; }
+.message.assistant pre code { background: none; padding: 0; }
+.message.assistant blockquote { border-left: 3px solid #ddd; padding-left: 10px; color: #666; margin: 6px 0; }
+.message.assistant table { border-collapse: collapse; width: 100%; margin: 8px 0; font-size: 13px; }
+.message.assistant th { background: #f5f5f5; font-weight: 600; text-align: left; padding: 8px 10px; border: 1px solid #ddd; }
+.message.assistant td { padding: 6px 10px; border: 1px solid #eee; }
+.message.assistant tr:hover { background: #fafafa; }
+
+.sources { margin-top: 12px; padding-top: 10px; border-top: 1px solid #eee; }
+.sources-title { font-size: 12px; color: #888; margin-bottom: 6px; font-weight: 600; }
+.source-item { font-size: 12px; color: #666; padding: 4px 0; display: flex; gap: 8px; align-items: center; }
+.source-badge { font-size: 10px; padding: 2px 8px; border-radius: 10px; font-weight: 500; }
+.source-badge.medical { background: #e8f5e9; color: #2e7d32; }
+.source-badge.event { background: #e3f2fd; color: #1565c0; }
+.source-score { color: #aaa; font-size: 11px; }
+
+.typing { display: flex; gap: 4px; padding: 8px 0; }
+.typing span { width: 6px; height: 6px; background: #ccc; border-radius: 50%; animation: bounce 1.4s infinite; }
+.typing span:nth-child(2) { animation-delay: 0.2s; }
+.typing span:nth-child(3) { animation-delay: 0.4s; }
+@keyframes bounce { 0%, 80%, 100% { transform: translateY(0); } 40% { transform: translateY(-8px); } }
+
+.input-area { background: white; padding: 16px 24px; border-top: 1px solid #e0e0e0; display: flex; gap: 12px; }
+.input-area input { flex: 1; padding: 12px 16px; border: 1px solid #ddd; border-radius: 12px; font-size: 14px; outline: none; transition: border 0.2s; }
+.input-area input:focus { border-color: #1a1a2e; }
+.input-area button { padding: 12px 24px; background: #1a1a2e; color: white; border: none; border-radius: 12px; font-size: 14px; cursor: pointer; transition: background 0.2s; }
+.input-area button:hover { background: #16213e; }
+.input-area button:disabled { background: #ccc; cursor: not-allowed; }
+
+.empty-state { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; color: #aaa; gap: 12px; }
+.empty-state .icon { font-size: 48px; }
+.empty-state p { font-size: 14px; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>Medical & Event RAG Chatbot</h1>
+  <span class="badge">Vertex AI + Gemini</span>
+</div>
+
+<div class="filter-bar">
+  <label>문서 필터:</label>
+  <select id="sourceFilter">
+    <option value="">전체</option>
+    <option value="medical">의료 문서</option>
+    <option value="event">행사 문서</option>
+  </select>
+</div>
+
+<div class="chat-container" id="chatContainer">
+  <div class="empty-state" id="emptyState">
+    <div class="icon">💬</div>
+    <p>의료 문서 또는 행사 문서에 대해 질문해 보세요</p>
+  </div>
+</div>
+
+<div class="input-area">
+  <input type="text" id="queryInput" placeholder="질문을 입력하세요..." autocomplete="off">
+  <button id="sendBtn" onclick="sendMessage()">전송</button>
+</div>
+
+<script>
+// Disable strikethrough to prevent ~ from rendering as del tags
+marked.use({ breaks: true, gfm: true });
+marked.use({
+  tokenizer: {
+    del(src) { return false; }
+  }
+});
+
+let sessionId = null;
+const API_URL = window.location.origin;
+
+const chatContainer = document.getElementById('chatContainer');
+const queryInput = document.getElementById('queryInput');
+const sendBtn = document.getElementById('sendBtn');
+const emptyState = document.getElementById('emptyState');
+const sourceFilter = document.getElementById('sourceFilter');
+
+queryInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.isComposing) sendMessage();
+});
+
+function addMessage(text, role, sources) {
+  if (emptyState) emptyState.remove();
+
+  const msg = document.createElement('div');
+  msg.className = `message ${role}`;
+
+  let html = role === 'assistant' ? marked.parse(text.replace(/\s*\[[\d,\s]+\]/g, '').replace(/~/g, '〜')) : text.replace(/\n/g, '<br>');
+
+  if (sources && sources.length > 0) {
+    html += '<div class="sources"><div class="sources-title">참고 출처</div>';
+    sources.forEach(s => {
+      if (s.source_file === 'Unknown') return;
+      const typeClass = s.source_type === 'medical' ? 'medical' : 'event';
+      const typeLabel = s.source_type === 'medical' ? '의료' : '행사';
+      const page = s.page_number ? ` (p.${s.page_number})` : '';
+      html += `<div class="source-item">
+        <span class="source-badge ${typeClass}">${typeLabel}</span>
+        <span>${s.source_file}${page}</span>
+        <span class="source-score">${(s.relevance_score * 100).toFixed(1)}%</span>
+      </div>`;
+    });
+    html += '</div>';
+  }
+
+  msg.innerHTML = html;
+  chatContainer.appendChild(msg);
+  chatContainer.scrollTop = chatContainer.scrollHeight;
+  return msg;
+}
+
+function addTyping() {
+  const msg = document.createElement('div');
+  msg.className = 'message assistant';
+  msg.id = 'typing';
+  msg.innerHTML = '<div class="typing"><span></span><span></span><span></span></div>';
+  chatContainer.appendChild(msg);
+  chatContainer.scrollTop = chatContainer.scrollHeight;
+}
+
+function removeTyping() {
+  const el = document.getElementById('typing');
+  if (el) el.remove();
+}
+
+async function sendMessage() {
+  const query = queryInput.value.trim();
+  if (!query) return;
+
+  queryInput.value = '';
+  sendBtn.disabled = true;
+
+  addMessage(query, 'user');
+
+  // Create empty assistant message for streaming
+  if (emptyState) emptyState.remove();
+  const msg = document.createElement('div');
+  msg.className = 'message assistant';
+  const contentDiv = document.createElement('div');
+  contentDiv.className = 'stream-content';
+  msg.appendChild(contentDiv);
+  chatContainer.appendChild(msg);
+
+  let fullText = '';
+  let sources = null;
+
+  try {
+    const body = { query, stream: true };
+    if (sessionId) body.session_id = sessionId;
+    const filter = sourceFilter.value;
+    if (filter) body.source_type_filter = filter;
+
+    const res = await fetch(`${API_URL}/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+    if (!res.ok) {
+      contentDiv.innerHTML = '오류가 발생했습니다. 다시 시도해 주세요.';
+      return;
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        try {
+          const event = JSON.parse(line.slice(6));
+          if (event.type === 'token') {
+            fullText += event.content;
+            contentDiv.textContent = fullText;
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+          } else if (event.type === 'sources') {
+            sources = event.data;
+          } else if (event.type === 'done') {
+            if (event.session_id) sessionId = event.session_id;
+          }
+        } catch (e) {}
+      }
+    }
+
+    // Render final markdown
+    if (fullText) {
+      contentDiv.innerHTML = marked.parse(fullText.replace(/\s*\[[\d,\s]+\]/g, '').replace(/~/g, '〜'));
+    }
+
+    // Add sources at the end
+    if (sources && sources.length > 0) {
+      let sourcesHtml = '<div class="sources"><div class="sources-title">참고 출처</div>';
+      sources.forEach(s => {
+        if (s.source_file === 'Unknown') return;
+        const typeClass = s.source_type === 'medical' ? 'medical' : 'event';
+        const typeLabel = s.source_type === 'medical' ? '의료' : '행사';
+        sourcesHtml += `<div class="source-item">
+          <span class="source-badge ${typeClass}">${typeLabel}</span>
+          <span>${s.source_file}</span>
+          <span class="source-score">${(s.relevance_score * 100).toFixed(1)}%</span>
+        </div>`;
+      });
+      sourcesHtml += '</div>';
+      msg.innerHTML = contentDiv.outerHTML + sourcesHtml;
+    }
+
+    // Fallback: if streaming returned nothing, try non-streaming
+    if (!fullText) {
+      contentDiv.innerHTML = '답변을 생성하지 못했습니다. 다시 시도해 주세요.';
+    }
+  } catch (err) {
+    contentDiv.innerHTML = '서버에 연결할 수 없습니다.';
+  } finally {
+    sendBtn.disabled = false;
+    queryInput.focus();
+  }
+}
+</script>
+
+</body>
+</html>
