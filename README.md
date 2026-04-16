@@ -1,6 +1,6 @@
-# Medical & Event RAG Chatbot
+# RAG Chatbot
 
-의료 문서와 행사 문서를 기반으로 한 RAG 챗봇 시스템입니다.
+RAG 챗봇 시스템입니다.
 
 ## 기술 스택
 
@@ -75,16 +75,16 @@ make run
 
 ```
 data/documents/
-├── 12768/
+├── [게시글 ID]/
 │   ├── data.json                  # 메타데이터 (필수)
-│   ├── AIRWAY VISTA 2023.md       # 본문
-│   ├── 초대장.jpg                  # 첨부 이미지 (자동 Vision 추출)
+│   ├── [게시글 제목].md            # 본문
+│   ├── [이미지].jpg               # 첨부 이미지 (자동 Vision 추출)
 │   └── .image_cache.json          # 이미지 추출 캐시 (자동 생성)
 ├── 9874/
 │   ├── data.json
-│   ├── 학술대회 개최.md
+│   ├── DCC 대회참가.md
 │   ├── 참가신청서.docx
-│   └── 초청장.pdf
+│   └── 대회 관련 자료.pdf
 └── ...
 ```
 
@@ -93,11 +93,11 @@ data/documents/
 ```json
 {
   "id": 12768,
-  "title": "AIRWAY VISTA 2023 개최 안내",
-  "category": "event",
-  "year": 2023,
-  "main_file": "AIRWAY VISTA 2023.md",
-  "attachments": ["초대장.jpg", "참가신청서.docx"]
+  "title": "2026 LCK 개최 안내",
+  "category": "Esport",
+  "year": 2026,
+  "main_file": "2026 LCK.md",
+  "attachments": ["LCK 행사 포스터.jpg", "LCK 행사 일정.pdf"]
 }
 ```
 
@@ -105,7 +105,7 @@ data/documents/
 |------|------|
 | `id` | 게시글 ID |
 | `title` | 게시글 제목 |
-| `category` | `"medical"` 또는 `"event"` |
+| `category` | `"Esport"` 또는 `"sport"` 등등| 
 | `year` | 연도 (없으면 `null`) |
 | `main_file` | 본문 파일명 |
 | `attachments` | 첨부파일 목록 |
@@ -162,9 +162,9 @@ uvicorn api.main:app --host 0.0.0.0 --port 8000 &
 
 ```json
 {
-  "query": "결핵 치료 원칙을 알려줘",
+  "query": "LCK 2026행사 일정을 알려줘",
   "session_id": "optional-session-id",
-  "source_type_filter": "medical",
+  "source_type_filter": "Esport",
   "stream": true
 }
 ```
