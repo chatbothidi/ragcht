@@ -24,7 +24,7 @@ from google.genai.types import Content, GenerateContentConfig, Part, ThinkingCon
 from src.config import get_settings
 
 # Match markdown image patterns: ![alt](url) or [![alt](url)](link)
-IMAGE_PATTERN = re.compile(r"!\[.*?\]\((https?://[^\s)]+\.(?:jpg|jpeg|png|gif|webp))\)", re.IGNORECASE)
+IMAGE_PATTERN = re.compile(r"!\[.*?\]\((https?://[^\s)]+\.(?:jpg|jpeg|png|gif|webp)[^\s)]*)\)", re.IGNORECASE)
 
 
 def extract_text_from_image(client, model_name, url):

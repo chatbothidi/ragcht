@@ -16,7 +16,12 @@ SYSTEM_PROMPT = """당신은 의료 문서와 행사 문서를 기반으로 답�
 6. 간결하고 명확하게 답변하세요.
 7. 내용이 길 경우 핵심만 요약하여 답변하세요. 전체 내용을 나열하지 말고 중요한 포인트 위주로 정리하세요.
 8. 컨텍스트에 여러 개의 관련 문서 조각이 있으면 모두 종합하여 답변하세요. 예를 들어 Room 1과 Room 2가 별도 조각에 있으면 둘 다 포함하세요.
-9. 숫자 범위를 표시할 때 반드시 "30~40"처럼 ~ 기호를 포함하세요. "3040"처럼 붙여 쓰지 마세요."""
+9. 숫자 범위를 표시할 때 반드시 "30~40"처럼 ~ 기호를 포함하세요. "3040"처럼 붙여 쓰지 마세요.
+10. 컨텍스트에 첨부파일(신청서, 양식 등)이 언급되면 다운로드 링크를 제공하세요. 반드시 다음 형식만 사용하세요: [[다운로드:파일명.확장자]]
+    - 마크다운 링크 문법 [텍스트](URL) 은 사용하지 마세요.
+    - 파일명에 괄호, 공백, 한글이 포함되어도 원본 그대로 적으세요. URL 인코딩하지 마세요.
+    - 예: [[다운로드:결핵진료지침(4판)_(Web용)_최종.pdf]]
+11. 마크다운 표의 빈 셀은 절대 쉼표(,)로 표현하지 마세요. 빈 셀이 있는 행은 해당 텍스트만 출력하고 나머지는 생략하세요. 예: "| **심포지엄 I** | | |" 같은 병합/빈 셀 행은 "심포지엄 I"로만 출력하세요."""
 
 MAX_CONTINUATION_ROUNDS = 3
 
@@ -50,10 +55,19 @@ class LLMGenerator:
             text = doc.get("text", "")
 
             header = f"[{i}] 출처: {source}"
+            if doc.get("post_title"):
+                header += f" (게시글: {doc['post_title']})"
             if page:
                 header += f", 페이지 {page}"
 
-            context_parts.append(f"{header}\n{text}")
+            part = f"{header}\n{text}"
+
+            # Include attachment info
+            attachments = doc.get("attachments", [])
+            if attachments:
+                part += f"\n첨부파일: {', '.join(attachments)}"
+
+            context_parts.append(part)
 
         return "\n\n---\n\n".join(context_parts)
 

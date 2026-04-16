@@ -15,8 +15,7 @@ dist/
 build/
 
 # Data
-data/documents/
-data/bm25_index/
+data/
 
 # IDE
 .vscode/

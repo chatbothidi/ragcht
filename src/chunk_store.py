@@ -14,7 +14,7 @@ class ChunkStore:
     def save_chunks(self, chunk_ids: list[str], chunks: list[DocumentChunk]) -> None:
         """Save chunk ID -> metadata mapping."""
         for chunk_id, chunk in zip(chunk_ids, chunks):
-            self._chunks[chunk_id] = {
+            entry = {
                 "text": chunk.text,
                 "source_file": chunk.source_file,
                 "source_type": chunk.source_type,
@@ -22,6 +22,15 @@ class ChunkStore:
                 "page_number": chunk.page_number,
                 "section_title": chunk.section_title,
             }
+            # Add post metadata if available
+            if chunk.metadata:
+                if "post_id" in chunk.metadata:
+                    entry["post_id"] = chunk.metadata["post_id"]
+                if "post_title" in chunk.metadata:
+                    entry["post_title"] = chunk.metadata["post_title"]
+                if "attachments" in chunk.metadata:
+                    entry["attachments"] = chunk.metadata["attachments"]
+            self._chunks[chunk_id] = entry
         self._persist()
 
     def get_chunk(self, chunk_id: str) -> dict | None:

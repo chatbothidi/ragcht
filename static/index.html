@@ -28,6 +28,8 @@ body { font-family: 'Pretendard', -apple-system, sans-serif; background: #f5f5f5
 .message.assistant ul, .message.assistant ol { margin: 4px 0 4px 20px; }
 .message.assistant li { margin: 2px 0; }
 .message.assistant strong { font-weight: 600; }
+.message.assistant a { color: #1a73e8; text-decoration: none; font-weight: 500; }
+.message.assistant a:hover { text-decoration: underline; }
 .message.assistant code { background: #f0f0f0; padding: 1px 5px; border-radius: 3px; font-size: 13px; }
 .message.assistant pre { background: #f5f5f5; padding: 10px; border-radius: 6px; overflow-x: auto; margin: 6px 0; }
 .message.assistant pre code { background: none; padding: 0; }
@@ -113,13 +115,26 @@ queryInput.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.isComposing) sendMessage();
 });
 
+function rewriteDownloadMarkers(text) {
+  return text.replace(/\[\[다운로드:([^\]]+?)\]\]/g, (_, filename) => {
+    const trimmed = filename.trim();
+    return '[' + trimmed + ' 다운로드](/admin/download/' + encodeURIComponent(trimmed) + ')';
+  });
+}
+
 function addMessage(text, role, sources) {
   if (emptyState) emptyState.remove();
 
   const msg = document.createElement('div');
   msg.className = `message ${role}`;
 
-  let html = role === 'assistant' ? marked.parse(text.replace(/\s*\[[\d,\s]+\]/g, '').replace(/~/g, '〜')) : text.replace(/\n/g, '<br>');
+  let cleanText = role === 'assistant'
+    ? text.replace(/\s*\[[\d,\s]+\]/g, '').replace(/~/g, '〜').replace(/,{2,}/g, '')
+    : text;
+  if (role === 'assistant') {
+    cleanText = rewriteDownloadMarkers(cleanText);
+  }
+  let html = role === 'assistant' ? marked.parse(cleanText) : cleanText.replace(/\n/g, '<br>');
 
   if (sources && sources.length > 0) {
     html += '<div class="sources"><div class="sources-title">참고 출처</div>';
@@ -226,7 +241,9 @@ async function sendMessage() {
 
     // Render final markdown
     if (fullText) {
-      contentDiv.innerHTML = marked.parse(fullText.replace(/\s*\[[\d,\s]+\]/g, '').replace(/~/g, '〜'));
+      let finalText = fullText.replace(/\s*\[[\d,\s]+\]/g, '').replace(/~/g, '〜').replace(/,{2,}/g, '');
+      finalText = rewriteDownloadMarkers(finalText);
+      contentDiv.innerHTML = marked.parse(finalText);
     }
 
     // Add sources at the end

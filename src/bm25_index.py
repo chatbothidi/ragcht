@@ -47,6 +47,9 @@ class BM25Index:
         ]
 
         tokenized = [self.tokenize(text) for text in self.chunk_texts]
+        if not tokenized:
+            self.bm25 = None
+            return
         self.bm25 = BM25Okapi(tokenized)
 
     def search(

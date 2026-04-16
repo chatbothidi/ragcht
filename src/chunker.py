@@ -66,6 +66,7 @@ class DocumentChunker:
                         chunk_index=len(chunks),
                         section_title=section_title,
                         page_number=self._estimate_page(document, chunk_text),
+                        metadata=document.metadata,
                     )
                 )
 
@@ -82,6 +83,7 @@ class DocumentChunker:
                 source_type=document.source_type,
                 chunk_index=i,
                 page_number=self._estimate_page(document, text),
+                metadata=document.metadata,
             )
             for i, text in enumerate(texts)
         ]

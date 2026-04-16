@@ -1,6 +1,7 @@
 # GCP / Vertex AI
 google-cloud-aiplatform>=1.140.0
 # 롤백: google-cloud-aiplatform==1.71.1
+google-cloud-discoveryengine>=0.18.0
 google-auth>=2.35.0
 
 # LangChain (text splitters only)

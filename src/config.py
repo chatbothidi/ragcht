@@ -26,6 +26,10 @@ class Settings(BaseSettings):
     score_threshold: float = 0.65
     max_context_tokens: int = 4000
 
+    # Reranking
+    rerank_candidates: int = 50
+    rerank_top_k: int = 10
+
     # Conversation
     max_conversation_turns: int = 5
 
