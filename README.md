@@ -61,10 +61,6 @@ make setup
 # 5. 문서 인덱싱
 python scripts/index_documents.py --full
 
-# 6. 서버 실행
-make run
-```
-
 서버 실행 후 `http://localhost:8000`에서 채팅 UI에 접속할 수 있습니다.
 
 ## 문서 관리

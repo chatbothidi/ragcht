@@ -1,16 +1,36 @@
+import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from api.dependencies import get_pipeline
 from api.middleware import setup_middleware
 from api.routes import admin, chat, search
+
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Initializing pipeline components...")
+    pipeline = get_pipeline()
+    logger.info("Warming up (first query)...")
+    try:
+        pipeline.query(question="테스트", session_id="warmup")
+    except Exception:
+        pass
+    logger.info("Pipeline ready.")
+    yield
+
 
 app = FastAPI(
     title="Medical & Event RAG Chatbot",
     description="의료 문서와 행사 문서 기반 RAG 챗봇 API",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 setup_middleware(app)

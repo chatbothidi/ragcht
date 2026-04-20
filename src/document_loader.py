@@ -6,6 +6,7 @@ from pathlib import Path
 
 import chardet
 import fitz  # pymupdf
+fitz.TOOLS.mupdf_display_errors(False)
 from docx import Document as DocxDocument
 from google.cloud import documentai_v1 as documentai
 from google import genai
@@ -102,6 +103,8 @@ class DocumentLoader:
         path = Path(file_path)
         ext = path.suffix.lower()
 
+        fitz.TOOLS.mupdf_warnings(reset=True)
+
         if ext in self.IMAGE_EXTENSIONS:
             doc = self._load_image(path, source_type)
         elif ext == ".pdf":
@@ -112,6 +115,10 @@ class DocumentLoader:
             doc = self._load_text(path, source_type)
         else:
             raise ValueError(f"Unsupported file format: {ext}")
+
+        warnings = fitz.TOOLS.mupdf_warnings()
+        if warnings:
+            print(f"    [MuPDF WARNING] {path.name}:\n      {warnings.replace(chr(10), chr(10) + '      ')}")
 
         # Add post metadata
         if doc.metadata is None:

@@ -185,22 +185,28 @@ def incremental_index(loader, chunker, embeddings, vectorstore, chunk_store, bm2
             # Main file
             main_path = post_dir / main_file
             if main_path.exists() and main_path.suffix.lower() in all_supported:
-                doc = loader.load_file(
-                    str(main_path), category,
-                    post_id=metadata.get("id"), post_title=title,
-                    attachments=attachments,
-                )
-                documents.append(doc)
+                try:
+                    doc = loader.load_file(
+                        str(main_path), category,
+                        post_id=metadata.get("id"), post_title=title,
+                        attachments=attachments,
+                    )
+                    documents.append(doc)
+                except Exception as e:
+                    print(f"    [SKIP] {main_path.name}: {e}")
 
             # Attachments
             for att_name in attachments:
                 att_path = post_dir / att_name
                 if att_path.exists() and att_path.suffix.lower() in all_supported:
-                    doc = loader.load_file(
-                        str(att_path), category,
-                        post_id=metadata.get("id"), post_title=title,
-                    )
-                    documents.append(doc)
+                    try:
+                        doc = loader.load_file(
+                            str(att_path), category,
+                            post_id=metadata.get("id"), post_title=title,
+                        )
+                        documents.append(doc)
+                    except Exception as e:
+                        print(f"    [SKIP] {att_path.name}: {e}")
 
             if not documents:
                 continue
