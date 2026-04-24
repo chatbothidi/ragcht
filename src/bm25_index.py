@@ -42,6 +42,9 @@ class BM25Index:
                 "chunk_index": c.chunk_index,
                 "page_number": c.page_number,
                 "text": c.text,
+                "post_id": (c.metadata or {}).get("post_id"),
+                "post_title": (c.metadata or {}).get("post_title"),
+                "year": (c.metadata or {}).get("year"),
             }
             for c in chunks
         ]
@@ -81,6 +84,9 @@ class BM25Index:
                     "source_file": meta["source_file"],
                     "source_type": meta["source_type"],
                     "page_number": meta["page_number"],
+                    "post_id": meta.get("post_id"),
+                    "post_title": meta.get("post_title"),
+                    "year": meta.get("year"),
                 }
             )
 

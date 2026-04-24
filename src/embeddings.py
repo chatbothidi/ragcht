@@ -1,74 +1,110 @@
+import asyncio
 import hashlib
+import json
+import logging
 import random
-import time
-from functools import lru_cache
 
-import vertexai
-from google.api_core.exceptions import (
-    DeadlineExceeded,
-    InternalServerError,
-    ResourceExhausted,
-    ServiceUnavailable,
-)
-from vertexai.language_models import TextEmbeddingInput, TextEmbeddingModel
+import httpx
+from google import genai
+from google.genai import errors as genai_errors
+from google.genai import types
+from redis.asyncio import Redis
 
 from src.config import Settings
 
+logger = logging.getLogger(__name__)
+
 _RETRYABLE_EXCEPTIONS = (
-    ServiceUnavailable,
-    DeadlineExceeded,
-    InternalServerError,
-    ResourceExhausted,
+    genai_errors.ServerError,
+    httpx.TimeoutException,
+    httpx.ConnectError,
 )
 
 
+def _is_retryable(exc: Exception) -> bool:
+    if isinstance(exc, _RETRYABLE_EXCEPTIONS):
+        return True
+    if isinstance(exc, genai_errors.ClientError) and getattr(exc, "code", None) == 429:
+        return True
+    return False
+
+
 class EmbeddingService:
-    def __init__(self, settings: Settings):
-        vertexai.init(
+    def __init__(self, settings: Settings, redis_client: Redis | None = None):
+        self.client = genai.Client(
+            vertexai=True,
             project=settings.gcp_project_id,
             location=settings.gcp_location,
         )
-        self.model = TextEmbeddingModel.from_pretrained(settings.embedding_model)
-        self._cache: dict[str, list[float]] = {}
+        self.model_name = settings.embedding_model
+        self.redis = redis_client
+        self.cache_ttl = settings.embedding_cache_ttl
 
-    def _get_embeddings_with_retry(
+    def _cache_key(self, text: str, task_type: str) -> str:
+        digest = hashlib.sha256(
+            f"{task_type}:{self.model_name}:{text}".encode()
+        ).hexdigest()
+        return f"emb:{digest}"
+
+    async def _embed_with_retry(
         self,
-        inputs: list[TextEmbeddingInput],
+        contents: list[str],
+        task_type: str,
         max_attempts: int = 6,
         initial_delay: float = 2.0,
-    ):
-        """Call Vertex AI embedding API with exponential backoff on transient errors."""
+    ) -> types.EmbedContentResponse:
+        """Call Vertex AI embedding API via google-genai with exponential backoff."""
         delay = initial_delay
         last_exc: Exception | None = None
         for attempt in range(1, max_attempts + 1):
             try:
-                return self.model.get_embeddings(inputs)
-            except _RETRYABLE_EXCEPTIONS as exc:
+                return await self.client.aio.models.embed_content(
+                    model=self.model_name,
+                    contents=contents,
+                    config=types.EmbedContentConfig(task_type=task_type),
+                )
+            except Exception as exc:
+                if not _is_retryable(exc):
+                    raise
                 last_exc = exc
                 if attempt == max_attempts:
                     break
-                sleep_for = delay + random.uniform(0, delay * 0.25)
-                print(
-                    f"  [embed] {type(exc).__name__} on attempt {attempt}/{max_attempts}; "
-                    f"retrying in {sleep_for:.1f}s"
+                is_quota = (
+                    isinstance(exc, genai_errors.ClientError)
+                    and getattr(exc, "code", None) == 429
                 )
-                time.sleep(sleep_for)
+                base = max(delay, 20.0) if is_quota else delay
+                sleep_for = base + random.uniform(0, base * 0.25)
+                logger.warning(
+                    "[embed] %s on attempt %d/%d; retrying in %.1fs",
+                    type(exc).__name__,
+                    attempt,
+                    max_attempts,
+                    sleep_for,
+                )
+                await asyncio.sleep(sleep_for)
                 delay *= 2
         raise last_exc  # type: ignore[misc]
 
-    def embed(self, text: str, task_type: str = "RETRIEVAL_QUERY") -> list[float]:
-        cache_key = hashlib.md5(f"{task_type}:{text}".encode()).hexdigest()
-        if cache_key in self._cache:
-            return self._cache[cache_key]
+    async def embed(self, text: str, task_type: str = "RETRIEVAL_QUERY") -> list[float]:
+        if self.redis is not None:
+            key = self._cache_key(text, task_type)
+            cached = await self.redis.get(key)
+            if cached:
+                logger.debug("embed_cache_hit key=%s", key[:16])
+                return json.loads(cached)
 
-        inputs = [TextEmbeddingInput(text=text, task_type=task_type)]
-        result = self._get_embeddings_with_retry(inputs)
-        embedding = result[0].values
+        response = await self._embed_with_retry([text], task_type)
+        embedding = list(response.embeddings[0].values)
 
-        self._cache[cache_key] = embedding
+        if self.redis is not None:
+            key = self._cache_key(text, task_type)
+            await self.redis.setex(key, self.cache_ttl, json.dumps(embedding))
+            logger.debug("embed_cache_miss key=%s", key[:16])
+
         return embedding
 
-    def embed_batch(
+    async def embed_batch(
         self,
         texts: list[str],
         task_type: str = "RETRIEVAL_DOCUMENT",
@@ -78,8 +114,7 @@ class EmbeddingService:
 
         for i in range(0, len(texts), batch_size):
             batch = texts[i : i + batch_size]
-            inputs = [TextEmbeddingInput(text=t, task_type=task_type) for t in batch]
-            results = self._get_embeddings_with_retry(inputs)
-            all_embeddings.extend([r.values for r in results])
+            response = await self._embed_with_retry(batch, task_type)
+            all_embeddings.extend([list(e.values) for e in response.embeddings])
 
         return all_embeddings

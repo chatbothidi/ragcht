@@ -22,7 +22,7 @@ async def chat(
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
-    result = pipeline.query(
+    result = await pipeline.query(
         question=request.query,
         session_id=request.session_id,
         source_type_filter=request.source_type_filter,
@@ -47,7 +47,7 @@ async def chat(
 
 
 async def _stream_response(pipeline: RAGPipeline, request: ChatRequest):
-    for event in pipeline.query_stream(
+    async for event in pipeline.query_stream(
         question=request.query,
         session_id=request.session_id,
         source_type_filter=request.source_type_filter,

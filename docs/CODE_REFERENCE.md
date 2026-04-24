@@ -22,8 +22,11 @@
 14. [api/middleware.py](#14-apimiddlewarepy) — 미들웨어
 15. [api/dependencies.py](#15-apidependenciespy) — 의존성 주입
 16. [api/routes/chat.py](#16-apirouteschatpy) — 채팅 API
-17. [api/routes/admin.py](#17-apiroutesadminpy) — 관리 API
-18. [scripts/index_documents.py](#18-scriptsindex_documentspy) — 인덱싱 스크립트
+17. [api/routes/search.py](#17-apiroutessearchpy) — 검색 API (리트리버 단독)
+18. [api/routes/admin.py](#18-apiroutesadminpy) — 관리 API
+19. [scripts/index_documents.py](#19-scriptsindex_documentspy) — 인덱싱 스크립트
+20. [scripts/migrate_to_firestore.py](#20-scriptsmigrate_to_firestorepy) — Firestore 이관 스크립트
+21. [infra/docker-compose.yml](#21-infradocker-composeyml) — 로컬 기동 구성
 
 ---
 
@@ -55,7 +58,11 @@ pydantic-settings 기반. `.env` 파일을 자동으로 읽습니다.
 | `rerank_candidates` | int | 50 | 리랭킹 전 후보 수 |
 | `rerank_top_k` | int | 10 | 리랭킹 후 상위 결과 수 |
 | `max_conversation_turns` | int | 5 | 대화 히스토리 최대 턴 수 |
-| `redis_url` | str \| None | None | Redis 주소 (미설정 시 인메모리) |
+| `redis_url` | str \| None | None | **필수**. Redis 주소. 미설정 시 `get_redis()` 호출 시점에 `RuntimeError`, `ConversationMemory` 생성 시 `ValueError` |
+| `embedding_cache_ttl` | int | 604800 | 임베딩 Redis 캐시 TTL (초, 기본 7일) |
+| `firestore_database_id` | str | "(default)" | Firestore 데이터베이스 ID |
+| `firestore_collection_name` | str | "medical_event_chunks" | 벡터 저장 컬렉션 이름 |
+| `vertex_*` | (legacy) | - | 이전 Matching Engine 관련. Firestore 전환 후 미사용 |
 
 ### `get_settings()`
 
@@ -238,79 +245,120 @@ chunk_document(document)
 
 ## 5. `src/embeddings.py`
 
-**역할**: 텍스트를 768차원 벡터로 변환합니다.
+**역할**: 텍스트를 768차원 벡터로 변환합니다. 모든 호출이 **async** 이며, 쿼리 임베딩은 Redis 캐시를 거칩니다.
 
 ### `EmbeddingService`
 
-#### `__init__(settings)`
-- `vertexai.init(project, location)` 으로 SDK 초기화
-- `TextEmbeddingModel.from_pretrained(model_name)` 으로 모델 로드
-- 인메모리 캐시 딕셔너리 (`_cache`) 초기화
+#### `__init__(settings, redis_client=None)`
+- `genai.Client(vertexai=True, ...)` 로 google-genai SDK 초기화 (async는 `self.client.aio.*`)
+- `redis_client` 는 쿼리 임베딩 캐시용. `None` 이면 캐시 비활성 (스크립트 용)
+- `cache_ttl` 은 `settings.embedding_cache_ttl` 기본 7일
 
-#### `embed(text, task_type="RETRIEVAL_QUERY")`
+#### `_cache_key(text, task_type)`
+- `sha256(f"{task_type}:{model_name}:{text}")` → `emb:{hex}` 키 반환
+
+#### `async embed(text, task_type="RETRIEVAL_QUERY")`
 - 단일 텍스트 임베딩 (검색 쿼리용)
-- MD5 해시 기반 인메모리 캐시 (동일 쿼리 재계산 방지)
-- `_get_embeddings_with_retry()` 호출
+- Redis 캐시 조회 → hit 시 즉시 반환, miss 시 API 호출 후 `setex(key, ttl, json.dumps(vec))`
+- 내부적으로 `_embed_with_retry()` 호출
 
-#### `embed_batch(texts, task_type="RETRIEVAL_DOCUMENT", batch_size=5)`
+#### `async embed_batch(texts, task_type="RETRIEVAL_DOCUMENT", batch_size=5)`
 - 다수 텍스트 임베딩 (문서 인덱싱용)
-- 5개씩 배치 처리
-- `_get_embeddings_with_retry()` 호출
+- 5개씩 배치 처리, 캐시 미사용 (인덱싱은 유일한 텍스트이므로)
 
-#### `_get_embeddings_with_retry(inputs, max_attempts=6, initial_delay=2.0)`
-- Vertex AI API 호출에 지수 백오프 재시도 적용
-- 재시도 대상 에러: `ServiceUnavailable`(503), `DeadlineExceeded`, `InternalServerError`(500), `ResourceExhausted`(429)
-- 딜레이: 2s → 4s → 8s → 16s → 32s → 64s (+ 25% 지터)
-- 6회 실패 시 최종 에러 발생
+#### `async _embed_with_retry(contents, task_type, max_attempts=6, initial_delay=2.0)`
+- `self.client.aio.models.embed_content(...)` 호출에 지수 백오프 재시도 적용
+- 재시도 대상: `genai_errors.ServerError`, `httpx.TimeoutException`, `httpx.ConnectError`, **`genai_errors.ClientError` with `code=429`**
+- 429는 baseline 20초로 연장 (일반 2초) — Vertex AI 쿼터 회복 속도 반영
+- 딜레이: 지수 증가 + 25% jitter, `await asyncio.sleep(...)` 사용
+- 최대 6회 실패 시 최종 예외 raise
+
+#### `_is_retryable(exc)` (모듈 함수)
+- 예외가 재시도 대상인지 판단 (429 포함)
 
 ---
 
 ## 6. `src/vectorstore.py`
 
-**역할**: Vertex AI Vector Search 인덱스를 생성하고 검색합니다.
+**역할**: Firestore Vector Search 를 사용해 벡터를 저장·검색합니다. 모든 호출 async. 이전 Vertex AI Matching Engine 은 2026-04-24 에 undeploy 하고 이 모듈로 대체됨.
 
-### `VectorStore`
-
-#### 상수
+### 모듈 상수
 
 | 상수 | 값 | 설명 |
 |------|---|------|
-| `EMBEDDING_DIM` | 768 | text-multilingual-embedding-002의 차원 수 |
+| `_BATCH_SIZE` | 500 | Firestore batch write 최대 크기 |
+
+### `VectorStore`
+
+#### 클래스 상수
+
+| 상수 | 값 | 설명 |
+|------|---|------|
+| `EMBEDDING_DIM` | 768 | text-multilingual-embedding-002 차원 수 |
 
 #### `__init__(settings)`
-- Vertex AI SDK 초기화
-- `vertex_index_id`와 `vertex_endpoint_id`가 설정돼 있으면 `load_existing()` 자동 호출
+- `google.cloud.firestore.AsyncClient` 생성 — `settings.gcp_project_id` + `settings.firestore_database_id`
+- 컬렉션 이름은 `settings.firestore_collection_name` (기본 `medical_event_chunks`)
+- **서버리스**: 별도 deploy/undeploy 없이 바로 사용 가능. 단, 운영 전에 `gcloud firestore indexes composite create` 로 벡터 인덱스를 한 번 만들어야 함.
 
-#### `create_collection()`
-- Vector Search 인덱스 생성 (Tree-AH, COSINE, STREAM_UPDATE)
-- 엔드포인트 생성 (public)
-- 인덱스를 엔드포인트에 배포
-- 최초 1회 `make setup`에서 호출
+#### `_collection()` (내부)
+- `self.client.collection(self.collection_name)` 반환
 
-#### `load_existing(index_id, endpoint_id)`
-- 리소스 ID로 기존 인덱스/엔드포인트 로드
+#### `async upsert(chunks, embeddings)` → `list[str]`
+- chunk 개수와 embedding 개수 불일치 시 `ValueError`
+- 각 chunk 당 UUID 를 생성하여 Firestore document ID 로 사용
+- `_BATCH_SIZE`(500) 단위로 `AsyncWriteBatch.set(...)` → `await batch.commit()`
+- Document 구조:
+  ```python
+  {
+      "text": str,
+      "embedding": Vector([768 floats]),   # google.cloud.firestore_v1.vector.Vector
+      "source_file": str,
+      "source_type": "medical" | "event",
+      "chunk_index": int,
+      # Optional fields:
+      "page_number": int,
+      "section_title": str,
+      "post_id": int, "post_title": str,
+      "year": int,
+      "attachments": list[str],
+  }
+  ```
 
-#### `upsert(chunks, embeddings)`
-- 청크별 UUID 생성
-- DataPoint 구성: 벡터 + `source_type` 네임스페이스 + `source_file` 크라우딩 태그
-- 100개씩 배치 업서트
-- 반환: 생성된 chunk ID 리스트
+#### `async search(query_vector, top_k=10, source_type_filter?)` → `list[dict]`
+- Firestore 의 `find_nearest()` KNN 쿼리
+- `DistanceMeasure.COSINE` 사용, `distance_result_field="distance"` 로 거리 반환 받음
+- `source_type_filter` 있으면 `FieldFilter` 로 pre-filter
+- 반환 dict 스키마:
+  ```python
+  {"id": "<doc_id>", "score": 1.0 - distance, **chunk_fields}
+  ```
+  (embedding 은 응답에서 제거해 클라이언트로 되돌려보내지 않음)
 
-**DataPoint 구조:**
-```python
-{
-    "datapoint_id": "uuid",
-    "feature_vector": [768 floats],
-    "restricts": [{"namespace": "source_type", "allow_list": ["medical"]}],
-    "crowding_tag": {"crowding_attribute": "파일명.pdf"}
-}
-```
+#### `async remove(ids)` → `int`
+- 주어진 document ID 리스트를 `_BATCH_SIZE` 단위로 삭제 (`batch.delete`)
 
-#### `search(query_vector, top_k=10, source_type_filter?)`
-- `find_neighbors()` 호출
-- `source_type_filter`가 있으면 `Namespace` 필터 적용
-- 반환: `[{"id": "...", "score": cosine_similarity}, ...]`
-- score = `1.0 - cosine_distance`
+#### `async close()`
+- AsyncClient 에 `close()` 가 있으면 await 하여 연결 정리
+
+### 필수 Firestore 인덱스 (one-time setup)
+
+쿼리 전에 2개 생성 필요:
+
+1. **Vector-only** (필터 없는 검색용):
+   ```
+   collection_group=medical_event_chunks
+   field: embedding (vector-config: dimension=768, flat)
+   ```
+2. **source_type + embedding** (필터 검색용):
+   ```
+   collection_group=medical_event_chunks
+   fields:
+     - source_type ASCENDING
+     - embedding (vector-config: dimension=768, flat)
+   ```
+
+둘 다 `gcloud firestore indexes composite create` 로 생성. READY 상태까지 수 분 ~ 십여 분 소요.
 
 ---
 
@@ -404,18 +452,20 @@ Vector Search는 벡터와 ID만 저장하므로, 원본 텍스트를 가져오�
 | 상수 | 값 | 설명 |
 |------|---|------|
 | `RRF_K` | 60 | RRF 공식의 상수 K |
+| `_RECENCY_PATTERN` | `최근\|최신\|요즘\|올해\|금년\|이번 해` | 시점 인텐트 감지 (rerank 풀 확장 + year 가중) |
+| `_SORT_PATTERN` | `정렬\|내림차순\|오름차순\|날짜순\|일자순\|순서대로\|순서로\|나열\|리스트\|목록` | 정렬/나열 인텐트 감지 (post_id dedupe + year DESC pre-sort) |
+| `_RECENCY_ALPHA` | 0.7 | recency 감지 시 year vs 시맨틱 점수 가중치 |
 
-#### `retrieve(query, top_k?, source_type_filter?)`
+#### `async retrieve(query, top_k?, source_type_filter?)`
 
-3단계를 순차 실행:
+전 구간 async. 3단계 + 선택적 재정렬을 순차 실행:
 
-**Stage 1: `_hybrid_search(query, source_type_filter)`**
+**Stage 1: `async _hybrid_search(query, source_type_filter)`**
 ```
-1. 쿼리 임베딩 생성 (task_type="RETRIEVAL_QUERY")
-2. Vector Search에서 상위 50개 후보 검색
+1. 임베딩 호출(async)과 BM25 검색(to_thread)을 asyncio.gather 로 병렬 실행
+2. Vector Search에서 상위 50개 후보 검색 (async, to_thread)
 3. ChunkStore에서 각 후보의 텍스트/메타데이터 보강
-4. BM25에서 상위 50개 후보 검색
-5. RRF 퓨전으로 두 결과 병합 → 50개 반환
+4. RRF 퓨전으로 두 결과 병합 → 50개 반환
 ```
 
 **RRF 공식:**
@@ -425,17 +475,17 @@ score(doc) = α × 1/(K + rank_vector + 1) + (1-α) × 1/(K + rank_bm25 + 1)
 - `α` = `HYBRID_ALPHA` (기본 0.6) → 벡터 검색에 60% 가중치
 - `K` = 60 (순위 차이의 영향을 완화)
 
-**Stage 2: `_rerank(query, candidates, top_n=10)`**
+**Stage 2: `async _rerank(query, candidates, top_n=10, recency_boost=False)`**
 ```
 1. 후보를 RankingRecord로 변환 (title + content 1000자)
-2. Discovery Engine Ranking API 호출
+2. Discovery Engine Ranking API 호출 (asyncio.to_thread)
    - 모델: "semantic-ranker-default@latest"
-   - 시맨틱 관련도로 재정렬
-3. 상위 10개 반환
-4. API 실패 시 → RRF 순서 유지 (폴백)
+   - recency_boost=True 면 top_n * 3 개까지 가져와 year 가중 재정렬
+3. 상위 10개(또는 확장된 수) 반환
+4. API 실패 시 → RRF 순서 유지 (폴백, logger.warning)
 ```
 
-**Stage 3: `_expand_by_post(results, max_chunks_per_post=5)`**
+**Stage 3: `_expand_by_post(results, max_chunks_per_post=5)` (sync)**
 ```
 1. 검색된 청크의 post_id 수집
 2. ChunkStore에서 같은 post_id의 다른 청크 탐색
@@ -443,6 +493,17 @@ score(doc) = α × 1/(K + rank_vector + 1) + (1-α) × 1/(K + rank_bm25 + 1)
 4. 원래 검색 결과 뒤에 확장 청크 추가
 ```
 - 목적: 하나의 게시글에서 여러 관련 정보를 함께 제공
+
+**Stage 3.5: `_prepare_for_sort(docs)` — `_SORT_PATTERN` 매칭 시만 실행 (static)**
+```
+1. post_id별로 가장 높은 rerank_score 청크 하나만 남김 (dedupe)
+2. post_id가 없는 청크는 orphan으로 보존
+3. (year DESC, score DESC) 기준 stable sort
+   - year None 은 -1 로 처리되어 맨 뒤
+4. 정렬된 docs 반환 → LLM 컨텍스트가 이미 정렬된 상태로 구성됨
+```
+- 목적: "날짜순 내림차순 정렬" 류 질문에서 LLM의 정렬 부담 경감
+- 보조 장치: `SYSTEM_PROMPT` 규칙 #13 이 "컨텍스트 순서 무시, 모든 항목 정렬" 을 강제
 
 ---
 
@@ -458,7 +519,7 @@ score(doc) = α × 1/(K + rank_vector + 1) + (1-α) × 1/(K + rank_bm25 + 1)
 
 ### `SYSTEM_PROMPT` (시스템 프롬프트)
 
-LLM의 동작을 제어하는 한국어 규칙 11개:
+LLM의 동작을 제어하는 한국어 규칙 **13개**:
 1. 제공된 컨텍스트만 사용
 2. 정보 없으면 검색 맥락 설명 + 미발견 안내
 3. 출처 번호 `[1]` 등 본문에 미표기
@@ -470,6 +531,15 @@ LLM의 동작을 제어하는 한국어 규칙 11개:
 9. 숫자 범위에 `~` 기호 포함
 10. 첨부파일은 `[[다운로드:파일명.확장자]]` 형식으로 링크
 11. 마크다운 표 빈 셀 처리 규칙
+12. "최근/최신/요즘" 질문 시 연도 내림차순 나열
+13. 정렬/나열 요청 시: 컨텍스트 순서 무시, **모든 항목** 정렬, 같은 게시글 1회만, 일/월 단위까지 비교
+
+### 모듈 함수
+
+| 함수 | 설명 |
+|------|------|
+| `_is_retryable(exc)` | 재시도 대상 판정. `ServerError`, `httpx.TimeoutException`, `httpx.ConnectError`, `ClientError(code=429)` |
+| `async _with_retry(coro_factory, *, label, max_attempts=5, initial_delay=2.0)` | 지수 백오프 공용 헬퍼. 429 감지 시 baseline 20초. 모든 Gemini 호출이 이를 거침 |
 
 ### `LLMGenerator`
 
@@ -483,27 +553,29 @@ LLM의 동작을 제어하는 한국어 규칙 11개:
 - `thinking_config`: 사고 예산 0 (thinking 비활성화)
 - `system_instruction`: SYSTEM_PROMPT 적용
 
-#### `generate(query, context, conversation_history?, temperature?)`
-- 비스트리밍 응답 생성
+#### `async generate(query, context, conversation_history?, temperature?)`
+- 비스트리밍 응답 생성 (async)
 - 대화 히스토리 최근 6턴 포함
 - 프롬프트: `컨텍스트:\n{context}\n\n질문: {query}\n\n위 컨텍스트를 기반으로 답변해 주세요.`
+- 모든 Gemini 호출이 `_with_retry(...)` 로 래핑됨 (429/5xx/네트워크 재시도)
 - `finish_reason == "MAX_TOKENS"`이면 최대 3회 연속 생성
   - "이어서 답변해 주세요." 메시지로 계속 생성 요청
   - 이전 응답을 누적 연결
 
-#### `generate_stream(query, context, conversation_history?, temperature?)`
-- SSE 스트리밍 응답 생성
-- `generate_content_stream()` 사용
+#### `async generate_stream(query, context, conversation_history?, temperature?)`
+- SSE 스트리밍 응답 생성 — `AsyncGenerator[str, None]` 반환
+- `self.client.aio.models.generate_content_stream(...)` 사용, 초기 호출을 `_with_retry` 로 래핑
 - 각 청크의 `.text`가 None이 아닌 경우만 yield
-- 연속 생성(MAX_TOKENS 처리) 없음
+- 연속 생성(MAX_TOKENS 처리) 없음 (스트리밍은 첫 청크 이후 재시도 불가)
 
-#### `rewrite_query(query, conversation_history)`
+#### `async rewrite_query(query, conversation_history)`
 - 멀티턴 대화에서 현재 질문을 독립적으로 이해 가능하게 리라이팅
 - 예: "그거 자세히" → "결핵 진료지침 4판의 치료 원칙을 자세히 알려줘"
 - 대화 히스토리 최근 4턴 참조
 - 규칙: 대명사 구체화, 시간/조건 미강제, 새 주제면 맥락 미적용
 - `temperature=0.1` (매우 결정적)
 - 결과가 5자 미만이면 원본 반환
+- Gemini 호출은 `_with_retry` 로 보호됨 (429 시 장시간 대기)
 
 #### `build_context(documents)`
 - 검색된 문서 리스트를 LLM 프롬프트용 컨텍스트 문자열로 조합
@@ -515,23 +587,22 @@ LLM의 동작을 제어하는 한국어 규칙 11개:
 
 ## 11. `src/memory.py`
 
-**역할**: 세션별 대화 히스토리를 관리합니다.
+**역할**: 세션별 대화 히스토리를 Redis 로 관리합니다. **Redis 필수**, in-memory fallback 은 제거되었습니다.
 
 ### `ConversationMemory`
 
-#### `__init__(redis_url?, max_turns=5, ttl=1800)`
-- `redis_url`이 있으면 Redis 클라이언트 생성
-- 없으면 인메모리 딕셔너리 사용 (`_local_store`)
+#### `__init__(redis_client: redis.asyncio.Redis, max_turns=5, ttl=1800)`
+- `redis_client` 가 `None` 이면 즉시 `ValueError`
 - `ttl`: Redis 키 만료 시간 (기본 30분)
 
 #### 메서드
 
 | 메서드 | 설명 |
 |--------|------|
-| `create_session()` | UUID v4 세션 ID 생성 |
-| `get_history(session_id)` | `[{"role": "user", "content": "..."}, {"role": "model", "content": "..."}]` 형태로 반환 |
-| `add_turn(session_id, user_message, assistant_message)` | user + model 메시지 쌍 추가. `max_turns * 2` 초과 시 오래된 메시지 삭제 |
-| `clear_session(session_id)` | 세션 기록 삭제 |
+| `create_session()` (sync) | UUID v4 세션 ID 생성 |
+| `async get_history(session_id)` | `[{"role": "user", "content": "..."}, {"role": "model", "content": "..."}]` 형태 반환 |
+| `async add_turn(session_id, user_message, assistant_message)` | user + model 메시지 쌍 추가. `max_turns * 2` 초과 시 오래된 메시지 삭제 후 `setex(key, ttl, json)` |
+| `async clear_session(session_id)` | `redis.delete(key)` |
 
 #### Redis 키 형식
 ```
@@ -543,36 +614,59 @@ chat:session:{session_id}
 
 ## 12. `src/rag_pipeline.py`
 
-**역할**: 검색 → 생성 → 메모리를 하나로 조합하는 오케스트레이터입니다.
+**역할**: 검색 → 생성 → 메모리를 하나로 조합하는 **async 오케스트레이터**입니다. 예외 발생 시 사용자에게 친절한 fallback 토큰을 yield 합니다.
+
+### 모듈 상수
+
+| 상수 | 값 | 용도 |
+|------|----|------|
+| `QUOTA_FALLBACK_MESSAGE` | "현재 요청이 몰려 답변을 생성할 수 없습니다..." | 429 ClientError 최종 실패 시 |
+| `GENERIC_FALLBACK_MESSAGE` | "답변 생성 중 오류가 발생했습니다..." | 기타 예외 / 빈 스트림 |
+
+### 모듈 함수
+
+- `_fallback_message(exc)` — 예외가 `ClientError(code=429)` 이면 `QUOTA_FALLBACK_MESSAGE`, 아니면 `GENERIC_FALLBACK_MESSAGE` 반환
 
 ### `RAGPipeline`
 
-#### `query(question, session_id?, source_type_filter?)`
+#### `async query(question, session_id?, source_type_filter?)`
 
 비스트리밍 전체 흐름:
 
 ```
 1. 세션 관리: session_id 없으면 생성
-2. 대화 히스토리 로드
-3. 히스토리 있으면 → 쿼리 리라이팅
-4. HybridRetriever.retrieve(검색 쿼리)
-5. 결과 없으면 → "관련 정보를 찾을 수 없습니다." 반환
-6. 컨텍스트 빌드 → Gemini 응답 생성
-7. 대화 히스토리에 현재 턴 저장
+2. 대화 히스토리 로드 (Redis)
+3. 히스토리 있으면 → 쿼리 리라이팅 (Gemini async)
+4. HybridRetriever.retrieve(검색 쿼리) async
+5. 결과 없으면 → "관련 정보를 찾을 수 없습니다." + add_turn 후 RAGResponse 반환
+6. 컨텍스트 빌드 → Gemini 응답 생성 (await)
+7. 대화 히스토리에 현재 턴 저장 (Redis)
 8. RAGResponse(answer, sources, query, ...) 반환
 ```
 
-#### `query_stream(question, session_id?, source_type_filter?)`
+#### `async query_stream(question, session_id?, source_type_filter?)`
 
-스트리밍 버전. Generator[dict] 반환:
+스트리밍 버전. `AsyncGenerator[dict, None]`. 예외 처리 포함:
 
 ```
-1~4. query()와 동일
-5. 결과 없으면 → {"type": "token", "content": "..."} + {"type": "done"} yield
-6. Gemini 스트리밍 → 토큰마다 {"type": "token", "content": "..."} yield
-7. 전체 답변을 히스토리에 저장
-8. {"type": "sources", "data": [...]} yield
-9. {"type": "done", "session_id": "..."} yield
+A. setup 블록(try/except):
+   1. session_id 확보
+   2. 대화 히스토리 로드 (Redis)
+   3. 히스토리 있으면 → 쿼리 리라이팅
+   4. HybridRetriever.retrieve
+   → 예외 시 _fallback_message(exc) 토큰 + done yield 후 종료
+
+B. 결과 없으면 → "관련 정보를 찾을 수 없습니다." 토큰 + done yield 후 종료
+
+C. 스트리밍 생성(try/except):
+   async for token in generator.generate_stream(...):
+       full_answer.append(token)
+       yield {"type": "token", "content": token}
+   → 예외 시 stream_failed 에 저장
+
+D. 결과 검증:
+   - 스트림 실패 or 빈 full_answer → fallback 토큰 + done yield 후 종료
+   - 정상 → Redis 에 add_turn, sources + done yield
 ```
 
 ---
@@ -581,12 +675,14 @@ chat:session:{session_id}
 
 **역할**: FastAPI 앱 초기화 및 서버 시작점입니다.
 
-### `lifespan(app)`
+### `async lifespan(app)`
 
 서버 시작 시 실행되는 asynccontextmanager:
-1. `get_pipeline()` 호출 → 모든 컴포넌트 초기화
-2. 워밍업 쿼리 `"테스트"` 실행 → gRPC 연결 수립
-3. `Pipeline ready.` 로그 후 요청 수락 시작
+1. `get_redis().ping()` 으로 Redis 연결 확인 (실패 시 앱 기동 중단)
+2. `get_pipeline()` 호출 → 모든 컴포넌트 초기화
+3. 워밍업: `await pipeline.query(question="테스트", session_id="warmup")` (실패는 무시)
+4. `Pipeline ready.` 로그 후 요청 수락 시작
+5. 종료 시: `await redis.aclose()` 로 연결 정리
 
 ### 라우트 등록
 
@@ -624,11 +720,12 @@ chat:session:{session_id}
 
 | 팩토리 함수 | 생성 객체 | 초기화 작업 |
 |-------------|----------|------------|
-| `get_embedding_service()` | EmbeddingService | Vertex AI SDK + 모델 로드 |
+| `get_redis()` | `redis.asyncio.Redis` | `Redis.from_url(settings.redis_url, decode_responses=True)`. `redis_url` 미설정 시 `RuntimeError` |
+| `get_embedding_service()` | EmbeddingService | google-genai 클라이언트 + Redis 캐시 주입 |
 | `get_vectorstore()` | VectorStore | 인덱스/엔드포인트 로드 |
 | `get_bm25_index()` | BM25Index | `bm25_index.pkl` 로드 |
-| `get_generator()` | LLMGenerator | Gemini 클라이언트 생성 |
-| `get_memory()` | ConversationMemory | Redis 연결 또는 인메모리 |
+| `get_generator()` | LLMGenerator | google-genai 클라이언트 생성 |
+| `get_memory()` | ConversationMemory | `get_redis()` 주입 (fallback 없음) |
 | `get_chunk_store()` | ChunkStore | `chunks.json` 로드 |
 | `get_retriever()` | HybridRetriever | 위 4개 + Discovery Engine |
 | `get_pipeline()` | RAGPipeline | retriever + generator + memory |
@@ -644,32 +741,56 @@ chat:session:{session_id}
 ```python
 @router.post("/chat")
 async def chat(request: ChatRequest, pipeline = Depends(get_pipeline)):
+    ...
+    result = await pipeline.query(...)
 ```
 
 - `stream=True` → `StreamingResponse`로 SSE 스트림 반환
-- `stream=False` → `ChatResponseModel` JSON 반환 (현재 프론트엔드 미사용)
+- `stream=False` → `ChatResponseModel` JSON 반환 (`await pipeline.query(...)`)
 
-### `_stream_response(pipeline, request)`
+### `async _stream_response(pipeline, request)`
 
-async generator. `pipeline.query_stream()`의 결과를 SSE 형식으로 변환:
+async generator. `async for event in pipeline.query_stream(...)` 결과를 SSE 형식으로 변환:
 ```
 data: {"type": "token", "content": "..."}\n\n
 data: {"type": "sources", "data": [...]}\n\n
 data: {"type": "done", "session_id": "..."}\n\n
 ```
 
-> 주의: try/except 없음. 예외 발생 시 스트림이 끊기고 프론트엔드에 에러가 표시되지 않음.
+> 예외 처리는 `rag_pipeline.query_stream` 이 담당 — 예외 발생 시 fallback 토큰이 yield 되므로 라우트는 그대로 통과시키면 됨.
 
 ---
 
-## 17. `api/routes/admin.py`
+## 17. `api/routes/search.py`
+
+**역할**: 리트리버 단독 호출 엔드포인트 (LLM 호출 없이 검색 결과만).
+
+### `POST /search`
+
+```python
+@router.post("/search")
+async def search(request: SearchRequest, retriever = Depends(get_retriever)):
+    results = await retriever.retrieve(
+        query=request.query,
+        top_k=request.top_k,
+        source_type_filter=request.source_type_filter,
+    )
+    return SearchResponseModel(results=results, query=request.query, total=len(results))
+```
+
+- 디버깅·튜닝 용도: 특정 쿼리가 어떤 청크를 retrieve 하는지 확인
+- 반환값은 retriever 가 내보내는 dict 리스트 그대로 (rerank_score 포함)
+
+---
+
+## 18. `api/routes/admin.py`
 
 **역할**: 헬스체크, 세션 관리, 파일 다운로드 엔드포인트입니다.
 
 | 엔드포인트 | 메서드 | 설명 |
 |-----------|--------|------|
 | `/admin/health` | GET | `{"status": "ok"}` 반환 |
-| `/admin/session/{session_id}` | DELETE | 대화 히스토리 삭제 |
+| `/admin/session/{session_id}` | DELETE | `await memory.clear_session(...)` — 대화 히스토리 삭제 |
 | `/admin/download/{filename}` | GET | `data/documents/` 하위에서 `rglob`으로 파일 검색 후 다운로드 |
 
 `download` 엔드포인트:
@@ -678,9 +799,9 @@ data: {"type": "done", "session_id": "..."}\n\n
 
 ---
 
-## 18. `scripts/index_documents.py`
+## 19. `scripts/index_documents.py`
 
-**역할**: 문서를 로드 → 청킹 → 임베딩 → Vector Search 업로드하는 CLI 스크립트입니다.
+**역할**: 문서를 로드 → 청킹 → 임베딩 → **Firestore 업로드** → BM25 재빌드하는 CLI 스크립트입니다. 전 구간 async.
 
 ### 실행 모드
 
@@ -691,31 +812,111 @@ python scripts/index_documents.py --add ID  # 특정 게시글 추가
 python scripts/index_documents.py --delete ID  # 특정 게시글 삭제
 ```
 
-### `incremental_index(loader, chunker, embeddings, vectorstore, chunk_store, bm25, doc_dir)`
+### 구조
+
+- `main()` 은 `asyncio.run(_main_async(args))` 로 진입. 모든 작업이 async.
+- `vectorstore` 는 `FirestoreVectorStore` 인스턴스. `upsert`, `remove` 모두 await.
+- 종료 시 `vectorstore.close()` 로 AsyncClient 정리.
+
+### `async incremental_index(...)`
 
 ```
 1. 디스크의 게시글 폴더 스캔 (data.json 있는 폴더의 post_id)
 2. ChunkStore에서 이미 인덱싱된 post_id 조회
-3. 차집합 계산:
+3. 차집합:
    new_posts = 디스크 - 인덱싱됨
    deleted_posts = 인덱싱됨 - 디스크
-4. deleted_posts의 청크 삭제 (Vector Search + ChunkStore)
+4. deleted_posts 의 청크 → await vectorstore.remove(ids) + ChunkStore 에서 제거
 5. new_posts 각각:
-   a. DocumentLoader.load_file() (try/except로 에러 시 [SKIP])
+   a. DocumentLoader.load_file() (try/except 로 에러 시 [SKIP])
    b. DocumentChunker.chunk_documents()
-   c. EmbeddingService.embed_batch()
-   d. VectorStore.upsert()
+   c. await embeddings.embed_batch(texts)
+   d. await vectorstore.upsert(chunks, embeddings)
    e. ChunkStore.save_chunks()
-6. 변경 있으면 BM25 인덱스 재빌드
+6. 변경 있으면 BM25 인덱스 재빌드 (_rebuild_bm25 helper)
 ```
 
-### `full_index(loader, chunker, embeddings, vectorstore, chunk_store, bm25, doc_dir)`
+### `async full_index(...)`
 
 ```
 1. DocumentLoader.load_directory() 로 전체 문서 로드
 2. DocumentChunker.chunk_documents()
-3. EmbeddingService.embed_batch()
-4. VectorStore.upsert()
-5. ChunkStore.save_chunks()
-6. BM25Index.build() + save()
+3. await embeddings.embed_batch(...)
+4. await _clear_firestore(vectorstore)  # 기존 collection 전체 삭제
+5. await vectorstore.upsert(chunks, embeddings)
+6. ChunkStore.save_chunks()
+7. BM25Index.build() + save()
 ```
+
+### `async _clear_firestore(vectorstore)`
+
+- 컬렉션 전체를 순회하며 모든 document ID 수집 → `await vectorstore.remove(all_ids)`
+- `--full` 모드에서만 호출됨. 증분 모드는 건드리지 않음.
+
+---
+
+## 20. `scripts/migrate_to_firestore.py`
+
+**역할**: `data/chunk_store/chunks.json` 에 이미 저장된 청크를 직접 재임베딩해서 Firestore 에만 업로드하는 **빠른 경로**. `DocumentLoader`/OCR/Chunker 를 건너뛰므로 Document AI·Gemini Vision 호출이 발생하지 않아 비용이 $0.33 수준으로 제한됨.
+
+### 사용 시나리오
+
+- Firestore 로 최초 이관할 때 (Vertex AI Matching Engine → Firestore)
+- chunks.json 이 이미 정상이고 Firestore 만 비어있을 때 빠르게 채울 때
+- 테스트 용도로 `--limit 100` 같이 소량만 업로드할 때
+
+### 실행
+
+```bash
+python scripts/migrate_to_firestore.py          # 전체 chunks.json 마이그레이션
+python scripts/migrate_to_firestore.py --limit 100  # 앞 100개만 (POC)
+python scripts/migrate_to_firestore.py --clear  # 기존 Firestore 컬렉션 비우고 시작
+```
+
+### 구조
+
+```
+1. chunks.json 로드
+2. --clear 지정 시 기존 컬렉션 모두 삭제
+3. 500개씩 페이지 단위로:
+   a. EmbeddingService.embed_batch(texts)  # Vertex AI embedding
+   b. VectorStore.upsert(chunks, vectors)  # Firestore batch write
+   c. 진행률 로그 출력
+4. 완료 메시지
+```
+
+### 주요 특징
+
+- BM25 재빌드·chunk_store 쓰기 등 **부수 작업 없음** — 순수 Firestore 업로드 전용
+- 16,737 chunks 기준 **약 10분** (embedding API 호출 대부분)
+- 재임베딩 비용: ~$0.33 (1K 문자당 $0.00002)
+- 중단해도 **멱등성 보장 안 됨** — 중복 ID 생성됨. 중간 실패 시 `--clear` 로 다시 시작 권장
+
+---
+
+## 21. `infra/docker-compose.yml`
+
+**역할**: 로컬 개발에서 app + Redis 를 함께 기동하는 구성.
+
+### 서비스
+
+| 서비스 | 역할 |
+|--------|------|
+| `app` | FastAPI 컨테이너. `infra/Dockerfile` 로 빌드. `.env` 를 `env_file` 로 읽고, `REDIS_URL` 과 `GOOGLE_APPLICATION_CREDENTIALS` 는 compose 가 강제 주입 |
+| `redis` | `redis:7-alpine`. healthcheck 로 `redis-cli ping` 을 주기적으로 수행 |
+
+### 핵심 설정
+
+- `environment: REDIS_URL=redis://redis:6379/0` — `.env` 의 값을 override 하여 컨테이너 간 네트워크 이름 사용
+- `environment: GOOGLE_APPLICATION_CREDENTIALS=/root/.config/gcloud/application_default_credentials.json`
+- `volumes: ${HOME}/.config/gcloud:/root/.config/gcloud:ro` — 호스트의 ADC 를 읽기 전용 마운트
+- `volumes: ../data:/app/data` — 문서/인덱스 데이터 공유
+- `depends_on: redis: condition: service_healthy` — Redis 가 ping 에 응답한 뒤 app 기동
+
+### 기동
+
+```bash
+docker compose -f infra/docker-compose.yml up --build
+```
+
+기동 로그에 `Redis connection OK` → `Pipeline ready.` 가 보이면 정상.

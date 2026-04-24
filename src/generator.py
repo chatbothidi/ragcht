@@ -1,9 +1,30 @@
-from collections.abc import Generator
+import asyncio
+import logging
+import random
+from collections.abc import AsyncGenerator
 
+import httpx
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai.types import Content, GenerateContentConfig, Part, ThinkingConfig
 
 from src.config import Settings
+
+logger = logging.getLogger(__name__)
+
+_RETRYABLE_EXCEPTIONS = (
+    genai_errors.ServerError,
+    httpx.TimeoutException,
+    httpx.ConnectError,
+)
+
+
+def _is_retryable(exc: Exception) -> bool:
+    if isinstance(exc, _RETRYABLE_EXCEPTIONS):
+        return True
+    if isinstance(exc, genai_errors.ClientError) and getattr(exc, "code", None) == 429:
+        return True
+    return False
 
 SYSTEM_PROMPT = """당신은 의료 문서와 행사 문서를 기반으로 답변하는 전문 AI 어시스턴트입니다.
 
@@ -21,9 +42,56 @@ SYSTEM_PROMPT = """당신은 의료 문서와 행사 문서를 기반으로 답�
     - 마크다운 링크 문법 [텍스트](URL) 은 사용하지 마세요.
     - 파일명에 괄호, 공백, 한글이 포함되어도 원본 그대로 적으세요. URL 인코딩하지 마세요.
     - 예: [[다운로드:결핵진료지침(4판)_(Web용)_최종.pdf]]
-11. 마크다운 표의 빈 셀은 절대 쉼표(,)로 표현하지 마세요. 빈 셀이 있는 행은 해당 텍스트만 출력하고 나머지는 생략하세요. 예: "| **심포지엄 I** | | |" 같은 병합/빈 셀 행은 "심포지엄 I"로만 출력하세요."""
+11. 마크다운 표의 빈 셀은 절대 쉼표(,)로 표현하지 마세요. 빈 셀이 있는 행은 해당 텍스트만 출력하고 나머지는 생략하세요. 예: "| **심포지엄 I** | | |" 같은 병합/빈 셀 행은 "심포지엄 I"로만 출력하세요.
+12. 사용자가 "최근", "최신", "요즘" 등 시점을 묻는 경우, 컨텍스트의 [연도: YYYY] 값을 기준으로 연도가 큰 문서(최신)부터 나열하세요. 연도 정보가 없는 문서는 뒤에 배치하세요.
+13. 사용자가 "정렬", "내림차순", "오름차순", "날짜순", "일자순", "나열", "리스트" 등 정렬/목록화를 요구하면 다음을 반드시 지키세요.
+    - 컨텍스트에 등장하는 순서를 무시하고 지정된 기준(날짜, 연도 등)으로 **모든 항목을 전부 정렬**하세요.
+    - 앞쪽만 정렬하고 뒤쪽을 그대로 이어붙이는 실수를 하지 마세요.
+    - 같은 행사(같은 게시글)는 한 번만 나열하고, 날짜/장소/주요 내용 정도로 간결히 요약하세요.
+    - 정렬 기준이 날짜인데 일/월까지 명시된 경우 일 단위까지 비교하세요. 연도만 있으면 연도로 비교하세요."""
 
 MAX_CONTINUATION_ROUNDS = 3
+
+
+async def _with_retry(
+    coro_factory,
+    *,
+    label: str,
+    max_attempts: int = 5,
+    initial_delay: float = 2.0,
+):
+    """Run an async callable with exponential backoff on retryable errors.
+
+    Treats 429 (quota exhausted) as retryable with a longer baseline delay.
+    """
+    delay = initial_delay
+    last_exc: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return await coro_factory()
+        except Exception as exc:
+            if not _is_retryable(exc):
+                raise
+            last_exc = exc
+            if attempt == max_attempts:
+                break
+            is_quota = (
+                isinstance(exc, genai_errors.ClientError)
+                and getattr(exc, "code", None) == 429
+            )
+            base = max(delay, 20.0) if is_quota else delay
+            sleep_for = base + random.uniform(0, base * 0.25)
+            logger.warning(
+                "[%s] %s on attempt %d/%d; retrying in %.1fs",
+                label,
+                type(exc).__name__,
+                attempt,
+                max_attempts,
+                sleep_for,
+            )
+            await asyncio.sleep(sleep_for)
+            delay *= 2
+    raise last_exc  # type: ignore[misc]
 
 
 class LLMGenerator:
@@ -57,12 +125,13 @@ class LLMGenerator:
             header = f"[{i}] 출처: {source}"
             if doc.get("post_title"):
                 header += f" (게시글: {doc['post_title']})"
+            if doc.get("year") is not None:
+                header += f" [연도: {doc['year']}]"
             if page:
                 header += f", 페이지 {page}"
 
             part = f"{header}\n{text}"
 
-            # Include attachment info
             attachments = doc.get("attachments", [])
             if attachments:
                 part += f"\n첨부파일: {', '.join(attachments)}"
@@ -71,7 +140,7 @@ class LLMGenerator:
 
         return "\n\n---\n\n".join(context_parts)
 
-    def generate(
+    async def generate(
         self,
         query: str,
         context: str,
@@ -96,16 +165,17 @@ class LLMGenerator:
 
         config = self._config(temperature)
 
-        # First call
-        response = self.client.models.generate_content(
-            model=self.model_name,
-            contents=contents,
-            config=config,
+        response = await _with_retry(
+            lambda: self.client.aio.models.generate_content(
+                model=self.model_name,
+                contents=contents,
+                config=config,
+            ),
+            label="generate",
         )
         text = response.text or ""
         finish_reason = self._get_finish_reason(response)
 
-        # If MAX_TOKENS, continue generating
         for _ in range(MAX_CONTINUATION_ROUNDS):
             if finish_reason != "MAX_TOKENS" or not text:
                 break
@@ -113,10 +183,13 @@ class LLMGenerator:
             contents.append(Content(role="model", parts=[Part(text=text)]))
             contents.append(Content(role="user", parts=[Part(text="이어서 답변해 주세요.")]))
 
-            response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=contents,
-                config=config,
+            response = await _with_retry(
+                lambda: self.client.aio.models.generate_content(
+                    model=self.model_name,
+                    contents=contents,
+                    config=config,
+                ),
+                label="generate-continue",
             )
             continuation = response.text or ""
             finish_reason = self._get_finish_reason(response)
@@ -126,13 +199,13 @@ class LLMGenerator:
 
         return text
 
-    def generate_stream(
+    async def generate_stream(
         self,
         query: str,
         context: str,
         conversation_history: list[dict[str, str]] | None = None,
         temperature: float = 0.3,
-    ) -> Generator[str, None, None]:
+    ) -> AsyncGenerator[str, None]:
         """Generate streaming response."""
         contents = []
 
@@ -149,11 +222,16 @@ class LLMGenerator:
 
         contents.append(Content(role="user", parts=[Part(text=user_message)]))
 
-        for chunk in self.client.models.generate_content_stream(
-            model=self.model_name,
-            contents=contents,
-            config=self._config(temperature),
-        ):
+        stream = await _with_retry(
+            lambda: self.client.aio.models.generate_content_stream(
+                model=self.model_name,
+                contents=contents,
+                config=self._config(temperature),
+            ),
+            label="generate-stream",
+        )
+
+        async for chunk in stream:
             if chunk.text:
                 yield chunk.text
 
@@ -170,7 +248,7 @@ class LLMGenerator:
             pass
         return "UNKNOWN"
 
-    def rewrite_query(
+    async def rewrite_query(
         self,
         query: str,
         conversation_history: list[dict[str, str]],
@@ -197,14 +275,17 @@ class LLMGenerator:
 3. 현재 질문이 새로운 주제를 묻는 것이라면 이전 대화의 맥락을 적용하지 마세요.
 4. 리라이팅된 질문만 출력하세요."""
 
-        response = self.client.models.generate_content(
-            model=self.model_name,
-            contents=prompt,
-            config=GenerateContentConfig(
-                temperature=0.1,
-                max_output_tokens=200,
-                thinking_config=ThinkingConfig(thinking_budget=0),
+        response = await _with_retry(
+            lambda: self.client.aio.models.generate_content(
+                model=self.model_name,
+                contents=prompt,
+                config=GenerateContentConfig(
+                    temperature=0.1,
+                    max_output_tokens=200,
+                    thinking_config=ThinkingConfig(thinking_budget=0),
+                ),
             ),
+            label="rewrite-query",
         )
         result = (response.text or "").strip()
         if not result or len(result) < 5:

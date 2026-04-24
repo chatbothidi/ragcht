@@ -89,11 +89,11 @@ data/documents/
 ```json
 {
   "id": 12768,
-  "title": "2026 LCK 개최 안내",
-  "category": "Esport",
+  "title": "2026 결핵및 호흡기학회 춘계학술대회 개최 안내",
+  "category": "event",
   "year": 2026,
-  "main_file": "2026 LCK.md",
-  "attachments": ["LCK 행사 포스터.jpg", "LCK 행사 일정.pdf"]
+  "main_file": "2026 결핵및 호흡기학회 춘계학술대회.md",
+  "attachments": ["2026 결핵및 호흡기학회 춘계학술대회.jpg", "2026 결핵및 호흡기학회 춘계학술대회 행사 일정.pdf"]
 }
 ```
 
@@ -101,7 +101,7 @@ data/documents/
 |------|------|
 | `id` | 게시글 ID |
 | `title` | 게시글 제목 |
-| `category` | `"Esport"` 또는 `"sport"` 등등| 
+| `category` | `"medical"` 또는 `"event"` 등등| 
 | `year` | 연도 (없으면 `null`) |
 | `main_file` | 본문 파일명 |
 | `attachments` | 첨부파일 목록 |

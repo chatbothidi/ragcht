@@ -12,7 +12,11 @@ class Settings(BaseSettings):
     llm_model: str = "gemini-2.0-flash"
     llm_location: str | None = None
 
-    # Vector Search
+    # Vector Search — Firestore Vector Search (serverless)
+    firestore_database_id: str = "(default)"
+    firestore_collection_name: str = "medical_event_chunks"
+
+    # Legacy Vertex AI Vector Search (Matching Engine) — kept for backward compat / rollback
     vertex_collection_name: str = "medical_event_docs"
     vertex_index_id: str | None = None
     vertex_endpoint_id: str | None = None
@@ -33,8 +37,11 @@ class Settings(BaseSettings):
     # Conversation
     max_conversation_turns: int = 5
 
-    # Redis
+    # Redis (required — used for session memory and embedding cache)
     redis_url: str | None = None
+
+    # Embedding cache TTL in seconds (7 days default)
+    embedding_cache_ttl: int = 7 * 24 * 3600
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 

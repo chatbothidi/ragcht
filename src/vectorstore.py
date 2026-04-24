@@ -1,130 +1,154 @@
+"""Firestore Vector Search backend.
+
+Replaces the prior Vertex AI Vector Search (Matching Engine) implementation
+with a serverless, pay-per-query Firestore collection that supports native
+KNN via `find_nearest`. The public interface (`upsert`, `search`) is preserved
+so `HybridRetriever` and `scripts/index_documents.py` keep working unchanged.
+"""
+import logging
 import uuid
 
-from google.cloud import aiplatform
-import vertexai
+from google.cloud.firestore import AsyncClient
+from google.cloud.firestore_v1.base_query import FieldFilter
+from google.cloud.firestore_v1.base_vector_query import DistanceMeasure
+from google.cloud.firestore_v1.vector import Vector
 
 from src.config import Settings
 from src.models import DocumentChunk
 
+logger = logging.getLogger(__name__)
+
+_BATCH_SIZE = 500  # Firestore batch write limit
+
 
 class VectorStore:
+    """Firestore Vector Search backend."""
+
     EMBEDDING_DIM = 768  # text-multilingual-embedding-002
 
     def __init__(self, settings: Settings):
-        vertexai.init(
-            project=settings.gcp_project_id,
-            location=settings.gcp_location,
-        )
         self.project = settings.gcp_project_id
-        self.location = settings.gcp_location
-        self.collection_name = settings.vertex_collection_name
+        self.database_id = settings.firestore_database_id
+        self.collection_name = settings.firestore_collection_name
+        self.client = AsyncClient(project=self.project, database=self.database_id)
 
-        aiplatform.init(
-            project=settings.gcp_project_id,
-            location=settings.gcp_location,
-        )
+    def _collection(self):
+        return self.client.collection(self.collection_name)
 
-        # Auto-load existing index and endpoint if IDs are configured
-        if settings.vertex_index_id and settings.vertex_endpoint_id:
-            self.load_existing(settings.vertex_index_id, settings.vertex_endpoint_id)
-
-    def create_collection(self) -> None:
-        """Create Vector Search index and endpoint if they don't exist."""
-        # Create index
-        self.index = aiplatform.MatchingEngineIndex.create_tree_ah_index(
-            display_name=self.collection_name,
-            dimensions=self.EMBEDDING_DIM,
-            approximate_neighbors_count=50,
-            distance_measure_type="COSINE_DISTANCE",
-            description="Medical and event document embeddings",
-            index_update_method="STREAM_UPDATE",
-        )
-
-        # Create endpoint
-        self.endpoint = aiplatform.MatchingEngineIndexEndpoint.create(
-            display_name=f"{self.collection_name}-endpoint",
-            public_endpoint_enabled=True,
-        )
-
-        # Deploy index to endpoint
-        self.endpoint.deploy_index(
-            index=self.index,
-            deployed_index_id=self.collection_name.replace("-", "_") + "_v2",
-            display_name=self.collection_name,
-        )
-
-    def load_existing(self, index_id: str, endpoint_id: str) -> None:
-        """Load existing index and endpoint by resource IDs."""
-        self.index = aiplatform.MatchingEngineIndex(index_name=index_id)
-        self.endpoint = aiplatform.MatchingEngineIndexEndpoint(
-            index_endpoint_name=endpoint_id
-        )
-
-    def upsert(
+    async def upsert(
         self,
         chunks: list[DocumentChunk],
         embeddings: list[list[float]],
     ) -> list[str]:
-        """Upsert vectors with metadata to the index. Returns datapoint IDs."""
-        datapoints = []
-        ids = []
-        for chunk, embedding in zip(chunks, embeddings):
-            dp_id = str(uuid.uuid4())
-            ids.append(dp_id)
-            datapoints.append(
-                {
-                    "datapoint_id": dp_id,
-                    "feature_vector": embedding,
-                    "restricts": [
-                        {
-                            "namespace": "source_type",
-                            "allow_list": [chunk.source_type],
-                        },
-                    ],
-                    "crowding_tag": {"crowding_attribute": chunk.source_file},
-                }
+        """Upsert vectors + chunk metadata into Firestore. Returns document IDs."""
+        if len(chunks) != len(embeddings):
+            raise ValueError(
+                f"chunks ({len(chunks)}) and embeddings ({len(embeddings)}) length mismatch"
             )
 
-        # Batch upsert
-        batch_size = 100
-        for i in range(0, len(datapoints), batch_size):
-            batch = datapoints[i : i + batch_size]
-            self.index.upsert_datapoints(datapoints=batch)
+        ids: list[str] = []
+        batch = self.client.batch()
+        batch_count = 0
+
+        for chunk, embedding in zip(chunks, embeddings):
+            doc_id = str(uuid.uuid4())
+            ids.append(doc_id)
+            doc_ref = self._collection().document(doc_id)
+
+            data: dict = {
+                "text": chunk.text,
+                "embedding": Vector(list(embedding)),
+                "source_file": chunk.source_file,
+                "source_type": chunk.source_type,
+                "chunk_index": chunk.chunk_index,
+            }
+            if chunk.page_number is not None:
+                data["page_number"] = chunk.page_number
+            if chunk.section_title:
+                data["section_title"] = chunk.section_title
+            if chunk.metadata:
+                # Flatten common metadata fields for querying
+                meta = chunk.metadata
+                if meta.get("post_id") is not None:
+                    data["post_id"] = meta["post_id"]
+                if meta.get("post_title"):
+                    data["post_title"] = meta["post_title"]
+                if meta.get("year") is not None:
+                    data["year"] = meta["year"]
+                if meta.get("attachments"):
+                    data["attachments"] = meta["attachments"]
+
+            batch.set(doc_ref, data)
+            batch_count += 1
+
+            if batch_count >= _BATCH_SIZE:
+                await batch.commit()
+                logger.info("Firestore upsert: committed %d docs", batch_count)
+                batch = self.client.batch()
+                batch_count = 0
+
+        if batch_count > 0:
+            await batch.commit()
+            logger.info("Firestore upsert: committed %d docs (final)", batch_count)
 
         return ids
 
-    def search(
+    async def search(
         self,
         query_vector: list[float],
         top_k: int = 10,
         source_type_filter: str | None = None,
     ) -> list[dict]:
-        """Search for similar vectors."""
-        from google.cloud.aiplatform.matching_engine.matching_engine_index_endpoint import (
-            Namespace,
-        )
-
-        filters = []
+        """KNN search via Firestore find_nearest. Returns list of dicts with id, score, and chunk fields."""
+        q = self._collection()
         if source_type_filter:
-            filters.append(
-                Namespace(name="source_type", allow_tokens=[source_type_filter])
-            )
+            q = q.where(filter=FieldFilter("source_type", "==", source_type_filter))
 
-        response = self.endpoint.find_neighbors(
-            deployed_index_id=self.collection_name.replace("-", "_") + "_v2",
-            queries=[query_vector],
-            num_neighbors=top_k,
-            filter=filters if filters else None,
+        vq = q.find_nearest(
+            vector_field="embedding",
+            query_vector=Vector(list(query_vector)),
+            distance_measure=DistanceMeasure.COSINE,
+            limit=top_k,
+            distance_result_field="distance",
         )
 
-        results = []
-        if response and response[0]:
-            for neighbor in response[0]:
-                results.append(
-                    {
-                        "id": neighbor.id,
-                        "score": 1.0 - neighbor.distance,  # cosine similarity
-                    }
-                )
-
+        results: list[dict] = []
+        async for snap in vq.stream():
+            d = snap.to_dict() or {}
+            distance = d.pop("distance", 0.0)
+            d.pop("embedding", None)  # Don't ship embedding vector to caller
+            results.append(
+                {
+                    "id": snap.id,
+                    "score": 1.0 - float(distance),  # cosine similarity
+                    **d,
+                }
+            )
         return results
+
+    async def remove(self, ids: list[str]) -> int:
+        """Delete documents by IDs. Returns number removed."""
+        if not ids:
+            return 0
+        removed = 0
+        batch = self.client.batch()
+        batch_count = 0
+        for doc_id in ids:
+            batch.delete(self._collection().document(doc_id))
+            batch_count += 1
+            removed += 1
+            if batch_count >= _BATCH_SIZE:
+                await batch.commit()
+                batch = self.client.batch()
+                batch_count = 0
+        if batch_count > 0:
+            await batch.commit()
+        return removed
+
+    async def close(self):
+        # AsyncClient has a close() coroutine in newer versions; ignore if missing
+        close_fn = getattr(self.client, "close", None)
+        if close_fn is not None:
+            result = close_fn()
+            if hasattr(result, "__await__"):
+                await result

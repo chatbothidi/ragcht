@@ -30,6 +30,8 @@ class ChunkStore:
                     entry["post_title"] = chunk.metadata["post_title"]
                 if "attachments" in chunk.metadata:
                     entry["attachments"] = chunk.metadata["attachments"]
+                if chunk.metadata.get("year") is not None:
+                    entry["year"] = chunk.metadata["year"]
             self._chunks[chunk_id] = entry
         self._persist()
 
@@ -53,15 +55,15 @@ class ChunkStore:
         return True
 
     def get_indexed_files(self) -> set[str]:
-        """Return set of source_file names already indexed."""
+        """이미 있는 인덱싱 된 파일을 보여줌"""
         return {c["source_file"] for c in self._chunks.values()}
 
     def get_ids_by_source(self, source_file: str) -> list[str]:
-        """Return chunk IDs for a given source file."""
+        """특정 Chunk ID를 가진 파일 보여줌"""
         return [cid for cid, c in self._chunks.items() if c["source_file"] == source_file]
 
     def remove_by_source(self, source_file: str) -> list[str]:
-        """Remove all chunks for a source file. Returns removed IDs."""
+        """해당 파일에 관련된 Chunks 데이터 모두 지우기. 지워진 ID 보여줌"""
         ids_to_remove = self.get_ids_by_source(source_file)
         for cid in ids_to_remove:
             del self._chunks[cid]

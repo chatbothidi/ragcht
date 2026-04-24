@@ -12,7 +12,7 @@ async def search(
     request: SearchRequest,
     retriever: HybridRetriever = Depends(get_retriever),
 ):
-    results = retriever.retrieve(
+    results = await retriever.retrieve(
         query=request.query,
         top_k=request.top_k,
         source_type_filter=request.source_type_filter,

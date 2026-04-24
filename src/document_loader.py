@@ -99,7 +99,8 @@ class DocumentLoader:
         self._cache_dirty = True
 
     def load_file(self, file_path: str, source_type: str, post_id: int | None = None,
-                  post_title: str | None = None, attachments: list[str] | None = None) -> LoadedDocument:
+                  post_title: str | None = None, attachments: list[str] | None = None,
+                  year: int | None = None) -> LoadedDocument:
         path = Path(file_path)
         ext = path.suffix.lower()
 
@@ -129,6 +130,8 @@ class DocumentLoader:
             doc.metadata["post_title"] = post_title
         if attachments:
             doc.metadata["attachments"] = attachments
+        if year is not None:
+            doc.metadata["year"] = year
 
         return doc
 
@@ -160,6 +163,7 @@ class DocumentLoader:
             title = metadata.get("title", "")
             main_file = metadata.get("main_file", "")
             attachments = metadata.get("attachments", [])
+            year = metadata.get("year")
 
             all_supported = self.SUPPORTED_EXTENSIONS | self.IMAGE_EXTENSIONS
 
@@ -169,7 +173,7 @@ class DocumentLoader:
                 doc = self.load_file(
                     str(main_path), category,
                     post_id=post_id, post_title=title,
-                    attachments=attachments,
+                    attachments=attachments, year=year,
                 )
                 docs.append(doc)
 
@@ -179,7 +183,7 @@ class DocumentLoader:
                 if att_path.exists() and att_path.suffix.lower() in all_supported:
                     doc = self.load_file(
                         str(att_path), category,
-                        post_id=post_id, post_title=title,
+                        post_id=post_id, post_title=title, year=year,
                     )
                     docs.append(doc)
 
@@ -200,7 +204,7 @@ class DocumentLoader:
 
     @staticmethod
     def _is_low_quality_text(text: str) -> bool:
-        """PDF에서 추출된 텍스트 품질이 낮은지 판단."""
+        """Check the quality of texts extracted pdfs if it is good or not."""
         if not text.strip():
             return True
 
@@ -210,11 +214,11 @@ class DocumentLoader:
         if chars == 0:
             return True
 
-        # 공백 비율이 50% 이상이면 품질 낮음
+        # Portion of blank is over 50% (Bad)
         if 1 - (chars / total) > 0.5:
             return True
 
-        # 단어 평균 길이가 2자 미만이면 품질 낮음
+        # Ａverage length of words is lower than 2 (Bad)
         words = text.split()
         if words and sum(len(w) for w in words) / len(words) < 2:
             return True

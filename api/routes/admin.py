@@ -22,7 +22,7 @@ async def clear_session(
     session_id: str,
     memory: ConversationMemory = Depends(get_memory),
 ):
-    memory.clear_session(session_id)
+    await memory.clear_session(session_id)
     return {"status": "cleared", "session_id": session_id}
 
 

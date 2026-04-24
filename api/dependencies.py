@@ -1,5 +1,7 @@
 from functools import lru_cache
 
+from redis.asyncio import Redis
+
 from src.bm25_index import BM25Index
 from src.chunk_store import ChunkStore
 from src.config import Settings, get_settings
@@ -12,8 +14,18 @@ from src.vectorstore import VectorStore
 
 
 @lru_cache
+def get_redis() -> Redis:
+    settings = get_settings()
+    if not settings.redis_url:
+        raise RuntimeError(
+            "REDIS_URL is required. Set it in .env or via environment variable."
+        )
+    return Redis.from_url(settings.redis_url, decode_responses=True)
+
+
+@lru_cache
 def get_embedding_service() -> EmbeddingService:
-    return EmbeddingService(get_settings())
+    return EmbeddingService(get_settings(), redis_client=get_redis())
 
 
 @lru_cache
@@ -37,7 +49,7 @@ def get_generator() -> LLMGenerator:
 def get_memory() -> ConversationMemory:
     settings = get_settings()
     return ConversationMemory(
-        redis_url=settings.redis_url,
+        redis_client=get_redis(),
         max_turns=settings.max_conversation_turns,
     )
 

@@ -8,7 +8,7 @@ from src.models import DocumentChunk, LoadedDocument
 
 
 class DocumentChunker:
-    # Common Korean medical document section headers
+    # 의료지침서 관련 섹션 헤더
     MEDICAL_HEADERS = re.compile(
         r"^(진단|소견|처방|검사결과|주소|병력|현병력|과거력|가족력|"
         r"신체검사|치료계획|경과|수술소견|퇴원요약|간호기록|"
@@ -41,7 +41,7 @@ class DocumentChunker:
         return all_chunks
 
     def _chunk_medical(self, document: LoadedDocument) -> list[DocumentChunk]:
-        """Hierarchical chunking: section headers → sentence boundaries."""
+        """Hierarchical chunking: 섹션 헤더 → 문장 범위"""
         sections = self._split_by_sections(document.text)
         chunks = []
 
@@ -49,7 +49,7 @@ class DocumentChunker:
             sentences = self._split_sentences(section_text)
             section_chunks = self._group_sentences(
                 sentences,
-                max_chars=self.chunk_size * 2,  # ~1.5 chars per token
+                max_chars=self.chunk_size * 2,  # 한국어는 1.5 ~ 2배 정도 토큰 수가 더 듦 
                 overlap_chars=self.chunk_overlap * 2,
             )
 
@@ -73,7 +73,7 @@ class DocumentChunker:
         return chunks
 
     def _chunk_event(self, document: LoadedDocument) -> list[DocumentChunk]:
-        """Standard recursive splitting for event documents."""
+        """행사 문서를 위한 Chunking loop."""
         texts = self.event_splitter.split_text(document.text)
 
         return [
@@ -97,7 +97,7 @@ class DocumentChunker:
 
         sections = []
 
-        # Text before first header
+        # 헤더 있기 전 텍스트들 (맨 첫페이지나 초반부) 
         if matches[0].start() > 0:
             sections.append((None, text[: matches[0].start()].strip()))
 
