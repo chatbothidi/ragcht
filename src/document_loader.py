@@ -1,20 +1,24 @@
 import base64
 import hashlib
 import json
+import random
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-
+import re
 import chardet
 import fitz  # pymupdf
 fitz.TOOLS.mupdf_display_errors(False)
 from docx import Document as DocxDocument
 from google.cloud import documentai_v1 as documentai
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai.types import Content, GenerateContentConfig, Part, ThinkingConfig
 
+from src.config import get_settings
 from src.models import LoadedDocument
 
-# Special unicode characters that cause markdown rendering issues
+# markdown 변환 시 문제되는 특수 기호들
 _NORMALIZE_MAP = str.maketrans({
     "\u223c": "~",   # TILDE OPERATOR → ~
     "\u301c": "~",   # WAVE DASH → ~
@@ -25,40 +29,94 @@ _NORMALIZE_MAP = str.maketrans({
     "\u00a0": " ",   # NO-BREAK SPACE → space
 })
 
-
 def _normalize_text(text: str) -> str:
-    """Normalize special unicode characters from PDF extraction."""
+    """pdf의 특수기호들 markdown에 맞게 변환."""
     return text.translate(_NORMALIZE_MAP)
 
-
 def _normalize_table_separators(text: str) -> str:
-    """Normalize overly long markdown table separators.
+    """긴 내용의 마크다운 테이블 짧게 변환
 
-    Converts patterns like '|:----...----:|' (300+ chars) to '|:---:|'.
+    '|:----...----:|' (300자 이상) 형태의 패턴을 '|:---:|' 형태로 변환.
     """
-    import re
-    # Match sequences of dashes (10+) optionally surrounded by colons
     return re.sub(r":?-{10,}:?", lambda m: ":---:" if ":" in m.group() else "---", text)
-
 
 class DocumentLoader:
     SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".doc", ".txt", ".md"}
     IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 
-    # Document AI OCR processor
-    DOCAI_PROCESSOR = "projects/544100649926/locations/us/processors/f0b50f9a399a78e6"
-
     CACHE_FILENAME = ".image_cache.json"
 
     def __init__(self, genai_client=None):
         self._docai_client = None
+        self._docai_processor: str | None = None
         self._genai_client = genai_client
+        self._llm_model: str | None = None
         self._current_cache: dict = {}
         self._current_cache_path: Path | None = None
         self._cache_dirty = False
 
+    def _ensure_genai_client(self) -> None:
+        """클라이언트가 주입되지 않은 경우 settings에서 Vertex genai 클라이언트를 lazy하게 생성."""
+        if self._genai_client is not None:
+            return
+        settings = get_settings()
+        self._genai_client = genai.Client(
+            vertexai=True,
+            project=settings.gcp_project_id,
+            location=settings.llm_location or settings.gcp_location,
+        )
+        self._llm_model = settings.llm_model
+
+    def _ensure_docai_client(self) -> None:
+        """settings에서 Document AI 클라이언트와 프로세서 이름을 lazy하게 로드."""
+        if self._docai_client is not None:
+            return
+        settings = get_settings()
+        self._docai_client = documentai.DocumentProcessorServiceClient(
+            client_options={"api_endpoint": "us-documentai.googleapis.com"}
+        )
+        self._docai_processor = settings.docai_processor
+
+    def _vision_generate_with_retry(self, contents, *, label: str, max_attempts: int = 3):
+        """Sync retry wrapper for Gemini Vision generate_content.
+
+        Retries 429 (RESOURCE_EXHAUSTED) and 5xx server errors with backoff.
+        Raises on non-retryable errors or after max_attempts.
+        """
+        delay = 2.0
+        last_exc: Exception | None = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return self._genai_client.models.generate_content(
+                    model=self._llm_model,
+                    contents=contents,
+                    config=GenerateContentConfig(
+                        max_output_tokens=8192,
+                        thinking_config=ThinkingConfig(thinking_budget=0),
+                    ),
+                )
+            except genai_errors.ClientError as exc:
+                if getattr(exc, "code", None) != 429:
+                    raise
+                last_exc = exc
+                if attempt == max_attempts:
+                    break
+                sleep_for = max(delay, 8.0) + random.uniform(0, 2.0)
+                print(f"  [Vision] 429 on {label} attempt {attempt}/{max_attempts}; retrying in {sleep_for:.1f}s")
+                time.sleep(sleep_for)
+                delay *= 2
+            except genai_errors.ServerError as exc:
+                last_exc = exc
+                if attempt == max_attempts:
+                    break
+                sleep_for = delay + random.uniform(0, delay * 0.25)
+                print(f"  [Vision] ServerError on {label} attempt {attempt}/{max_attempts}; retrying in {sleep_for:.1f}s")
+                time.sleep(sleep_for)
+                delay *= 2
+        raise last_exc  # type: ignore[misc]
+
     def _load_image_cache(self, post_dir: Path) -> dict:
-        """Load image cache for a post directory."""
+        """게시물 디렉터리의 이미지 캐시 로드."""
         cache_path = post_dir / self.CACHE_FILENAME
         self._current_cache_path = cache_path
         self._cache_dirty = False
@@ -70,18 +128,18 @@ class DocumentLoader:
         return self._current_cache
 
     def _save_image_cache(self) -> None:
-        """Save image cache if modified."""
+        """변경된 이미지 캐시 저장."""
         if self._cache_dirty and self._current_cache_path:
             with open(self._current_cache_path, "w", encoding="utf-8") as f:
                 json.dump(self._current_cache, f, ensure_ascii=False, indent=2)
 
     @staticmethod
     def _compute_hash(data: bytes) -> str:
-        """Compute MD5 hash of binary data."""
+        """바이너리 데이터의 MD5 해시 계산."""
         return hashlib.md5(data).hexdigest()
 
     def _get_cached_text(self, key: str, data: bytes) -> str | None:
-        """Check cache for extracted text. Returns cached text or None."""
+        """캐시에서 추출된 텍스트 확인. 캐시된 텍스트 또는 None 반환."""
         file_hash = self._compute_hash(data)
         cached = self._current_cache.get(key)
         if cached and cached.get("hash") == file_hash:
@@ -90,7 +148,7 @@ class DocumentLoader:
         return None
 
     def _set_cache(self, key: str, data: bytes, text: str) -> None:
-        """Save extracted text to cache."""
+        """추출된 텍스트를 캐시에 저장."""
         self._current_cache[key] = {
             "hash": self._compute_hash(data),
             "extracted_text": text,
@@ -100,7 +158,7 @@ class DocumentLoader:
 
     def load_file(self, file_path: str, source_type: str, post_id: int | None = None,
                   post_title: str | None = None, attachments: list[str] | None = None,
-                  year: int | None = None) -> LoadedDocument:
+                  year: int | None = None, url: str | None = None) -> LoadedDocument:
         path = Path(file_path)
         ext = path.suffix.lower()
 
@@ -121,7 +179,7 @@ class DocumentLoader:
         if warnings:
             print(f"    [MuPDF WARNING] {path.name}:\n      {warnings.replace(chr(10), chr(10) + '      ')}")
 
-        # Add post metadata
+        # 게시물 메타데이터 추가
         if doc.metadata is None:
             doc.metadata = {}
         if post_id is not None:
@@ -132,11 +190,13 @@ class DocumentLoader:
             doc.metadata["attachments"] = attachments
         if year is not None:
             doc.metadata["year"] = year
+        if url:
+            doc.metadata["url"] = url
 
         return doc
 
     def load_directory(self, directory: str) -> list[LoadedDocument]:
-        """Load documents from post ID-based directory structure."""
+        """게시물 ID 기반 디렉터리 구조에서 문서 로드."""
         docs = []
         base_path = Path(directory)
 
@@ -144,10 +204,10 @@ class DocumentLoader:
             if not post_dir.is_dir():
                 continue
 
-            # Read data.json for metadata
+            # 메타데이터를 위해 data.json 읽기
             data_json = post_dir / "data.json"
             if not data_json.exists():
-                # Fallback: old structure (medical/events folders)
+                # Fallback: 이전 구조 (medical/events 폴더)
                 if post_dir.name in ("medical", "events"):
                     docs.extend(self._load_old_structure(post_dir))
                 continue
@@ -155,7 +215,7 @@ class DocumentLoader:
             with open(data_json, encoding="utf-8") as f:
                 metadata = json.load(f)
 
-            # Load image cache for this post
+            # 해당 게시물의 이미지 캐시 로드
             self._load_image_cache(post_dir)
 
             post_id = metadata.get("id")
@@ -164,36 +224,37 @@ class DocumentLoader:
             main_file = metadata.get("main_file", "")
             attachments = metadata.get("attachments", [])
             year = metadata.get("year")
+            url = metadata.get("url")
 
             all_supported = self.SUPPORTED_EXTENSIONS | self.IMAGE_EXTENSIONS
 
-            # Load main file
+            # 메인 파일 로드
             main_path = post_dir / main_file
             if main_path.exists() and main_path.suffix.lower() in all_supported:
                 doc = self.load_file(
                     str(main_path), category,
                     post_id=post_id, post_title=title,
-                    attachments=attachments, year=year,
+                    attachments=attachments, year=year, url=url,
                 )
                 docs.append(doc)
 
-            # Load attachment files
+            # 첨부 파일 로드
             for att_name in attachments:
                 att_path = post_dir / att_name
                 if att_path.exists() and att_path.suffix.lower() in all_supported:
                     doc = self.load_file(
                         str(att_path), category,
-                        post_id=post_id, post_title=title, year=year,
+                        post_id=post_id, post_title=title, year=year, url=url,
                     )
                     docs.append(doc)
 
-            # Save image cache for this post
+            # 해당 게시물의 이미지 캐시 저장
             self._save_image_cache()
 
         return docs
 
     def _load_old_structure(self, subdir_path: Path) -> list[LoadedDocument]:
-        """Fallback: load from old medical/events folder structure."""
+        """Fallback: 이전 medical/events 폴더 구조에서 로드."""
         docs = []
         source_type = "medical" if subdir_path.name == "medical" else "event"
         for file_path in subdir_path.rglob("*"):
@@ -204,7 +265,7 @@ class DocumentLoader:
 
     @staticmethod
     def _is_low_quality_text(text: str) -> bool:
-        """Check the quality of texts extracted pdfs if it is good or not."""
+        """PDF에서 추출된 텍스트의 품질 검사."""
         if not text.strip():
             return True
 
@@ -214,11 +275,11 @@ class DocumentLoader:
         if chars == 0:
             return True
 
-        # Portion of blank is over 50% (Bad)
+        # 공백 비율이 50% 초과 (불량)
         if 1 - (chars / total) > 0.5:
             return True
 
-        # Ａverage length of words is lower than 2 (Bad)
+        # 단어 평균 길이가 2 미만 (불량)
         words = text.split()
         if words and sum(len(w) for w in words) / len(words) < 2:
             return True
@@ -228,7 +289,7 @@ class DocumentLoader:
     def _load_pdf(self, path: Path, source_type: str) -> LoadedDocument:
         pdf_data = path.read_bytes()
 
-        # Check cache
+        # 캐시 확인
         cached_text = self._get_cached_text(path.name, pdf_data)
         if cached_text is not None:
             return LoadedDocument(
@@ -238,13 +299,10 @@ class DocumentLoader:
                 metadata={"ocr": True, "cached": True},
             )
 
-        # Cache miss - run Document AI OCR
-        if self._docai_client is None:
-            self._docai_client = documentai.DocumentProcessorServiceClient(
-                client_options={"api_endpoint": "us-documentai.googleapis.com"}
-            )
+        # 캐시 미스 - Document AI OCR 실행
+        self._ensure_docai_client()
 
-        # Check page count - Document AI online limit is 30 pages
+        # 페이지 수 확인 - Document AI online 제한은 30페이지
         doc = fitz.open(str(path))
         total_pages = len(doc)
         doc.close()
@@ -258,7 +316,7 @@ class DocumentLoader:
 
         full_text = _normalize_text(full_text)
 
-        # Save to cache
+        # 캐시에 저장
         self._set_cache(path.name, pdf_data, full_text)
 
         return LoadedDocument(
@@ -270,13 +328,13 @@ class DocumentLoader:
         )
 
     def _ocr_pdf_bytes(self, pdf_data: bytes) -> tuple[str, list[dict]]:
-        """OCR a PDF that fits within the 30-page limit."""
+        """30페이지 제한 내의 PDF OCR 처리."""
         raw_document = documentai.RawDocument(
             content=pdf_data,
             mime_type="application/pdf",
         )
         request = documentai.ProcessRequest(
-            name=self.DOCAI_PROCESSOR,
+            name=self._docai_processor,
             raw_document=raw_document,
         )
         result = self._docai_client.process_document(request=request)
@@ -290,7 +348,7 @@ class DocumentLoader:
         return document.text, pages
 
     def _ocr_pdf_chunked(self, path: Path, total_pages: int, chunk_size: int = 15) -> tuple[str, list[dict]]:
-        """OCR a large PDF by splitting into chunks of 30 pages."""
+        """큰 PDF를 30페이지 단위로 분할해 OCR 처리."""
         all_text_parts = []
         all_pages = []
 
@@ -300,17 +358,17 @@ class DocumentLoader:
             end = min(start + chunk_size, total_pages)
             print(f"    Pages {start + 1}-{end}...")
 
-            # Extract page range to temporary PDF
+            # 페이지 범위를 임시 PDF로 추출
             chunk_doc = fitz.open()
             chunk_doc.insert_pdf(doc, from_page=start, to_page=end - 1)
             chunk_bytes = chunk_doc.tobytes()
             chunk_doc.close()
 
-            # OCR this chunk
+            # 해당 청크 OCR 처리
             text, pages = self._ocr_pdf_bytes(chunk_bytes)
 
             all_text_parts.append(text)
-            # Adjust page numbers
+            # 페이지 번호 조정
             for page in pages:
                 page["page"] += start
             all_pages.extend(pages)
@@ -329,10 +387,10 @@ class DocumentLoader:
         return "".join(segments)
 
     def _load_image(self, path: Path, source_type: str) -> LoadedDocument:
-        """Extract text from image file using Gemini Vision, with caching."""
+        """Gemini Vision으로 이미지 파일에서 텍스트 추출 (캐싱 포함)."""
         img_data = path.read_bytes()
 
-        # Check cache
+        # 캐시 확인
         cached_text = self._get_cached_text(path.name, img_data)
         if cached_text is not None:
             return LoadedDocument(
@@ -340,15 +398,7 @@ class DocumentLoader:
                 metadata={"image_ocr": True, "cached": True},
             )
 
-        if self._genai_client is None:
-            from src.config import get_settings
-            settings = get_settings()
-            self._genai_client = genai.Client(
-                vertexai=True,
-                project=settings.gcp_project_id,
-                location=settings.llm_location or settings.gcp_location,
-            )
-            self._llm_model = settings.llm_model
+        self._ensure_genai_client()
 
         print(f"  [Vision] Extracting text from image: {path.name}")
 
@@ -357,33 +407,31 @@ class DocumentLoader:
                     ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp"}
         mime_type = mime_map.get(ext, "image/jpeg")
 
-        response = self._genai_client.models.generate_content(
-            model=self._llm_model,
-            contents=Content(
-                role="user",
-                parts=[
-                    Part(inline_data={"mime_type": mime_type, "data": base64.b64encode(img_data).decode()}),
-                    Part(text="""이 이미지에서 텍스트를 추출해 주세요. 다음 규칙을 따르세요:
+        contents = Content(
+            role="user",
+            parts=[
+                Part(inline_data={"mime_type": mime_type, "data": base64.b64encode(img_data).decode()}),
+                Part(text="""이 이미지에서 텍스트를 추출해 주세요. 다음 규칙을 따르세요:
 1. 표(시간표, 프로그램 등)는 간결한 마크다운 표로 변환하세요. 구분선은 반드시 '| --- |' 형태로 짧게 유지하고, 절대 '-' 문자를 10개 이상 반복하지 마세요. 셀 내용에 과도한 공백(padding)을 넣지 마세요.
 2. 일반 텍스트(제목, 장소, 안내문 등)는 그대로 텍스트로 출력하세요.
 3. 표와 텍스트를 구분하여 정리하세요."""),
-                ],
-            ),
-            config=GenerateContentConfig(
-                max_output_tokens=8192,
-                thinking_config=ThinkingConfig(thinking_budget=0),
-            ),
+            ],
         )
+        try:
+            response = self._vision_generate_with_retry(contents, label=f"image:{path.name}")
+        except Exception as e:
+            print(f"  [Vision] Failed after retries for {path.name}: {e}")
+            return LoadedDocument(text="", source_file=path.name, source_type=source_type)
 
         text = response.text or ""
         if not text:
             print(f"  [Vision] No text extracted from {path.name}")
             return LoadedDocument(text="", source_file=path.name, source_type=source_type)
 
-        # Normalize overly long table separators
+        # 너무 긴 테이블 구분선 정규화
         text = _normalize_table_separators(text)
 
-        # Save to cache
+        # 캐시에 저장
         self._set_cache(path.name, img_data, text)
 
         print(f"  [Vision] Extracted {len(text)} chars from {path.name}")
@@ -414,7 +462,7 @@ class DocumentLoader:
         encoding = detected.get("encoding", "utf-8") or "utf-8"
         text = raw.decode(encoding)
 
-        # Auto-extract text from image URLs in markdown
+        # 마크다운 내 이미지 URL에서 텍스트 자동 추출
         image_urls = re.findall(
             r"!\[.*?\]\((https?://[^\s)]+\.(?:jpg|jpeg|png|gif|webp)[^\s)]*)\)",
             text, re.IGNORECASE,
@@ -427,38 +475,24 @@ class DocumentLoader:
                     if len(img_data) < 1000:
                         continue
 
-                    # Check cache
+                    # 캐시 확인
                     cached_text = self._get_cached_text(url, img_data)
                     if cached_text is not None:
                         extracted.append(cached_text)
                         continue
 
-                    # Cache miss - call Gemini Vision
-                    if self._genai_client is None:
-                        from src.config import get_settings
-                        settings = get_settings()
-                        self._genai_client = genai.Client(
-                            vertexai=True,
-                            project=settings.gcp_project_id,
-                            location=settings.llm_location or settings.gcp_location,
-                        )
-                        self._llm_model = settings.llm_model
+                    # 캐시 미스 - Gemini Vision 호출
+                    self._ensure_genai_client()
 
                     print(f"  [Vision] Extracting text from URL: {url}")
-                    response = self._genai_client.models.generate_content(
-                        model=self._llm_model,
-                        contents=Content(role="user", parts=[
-                            Part(inline_data={"mime_type": "image/jpeg", "data": base64.b64encode(img_data).decode()}),
-                            Part(text="""이 이미지에서 텍스트를 추출해 주세요. 다음 규칙을 따르세요:
+                    contents = Content(role="user", parts=[
+                        Part(inline_data={"mime_type": "image/jpeg", "data": base64.b64encode(img_data).decode()}),
+                        Part(text="""이 이미지에서 텍스트를 추출해 주세요. 다음 규칙을 따르세요:
 1. 표(시간표, 프로그램 등)는 간결한 마크다운 표로 변환하세요. 구분선은 반드시 '| --- |' 형태로 짧게 유지하고, 절대 '-' 문자를 10개 이상 반복하지 마세요. 셀 내용에 과도한 공백(padding)을 넣지 마세요.
 2. 일반 텍스트(제목, 장소, 안내문 등)는 그대로 텍스트로 출력하세요.
 3. 표와 텍스트를 구분하여 정리하세요."""),
-                        ]),
-                        config=GenerateContentConfig(
-                            max_output_tokens=8192,
-                            thinking_config=ThinkingConfig(thinking_budget=0),
-                        ),
-                    )
+                    ])
+                    response = self._vision_generate_with_retry(contents, label=f"url:{url[-40:]}")
                     if response.text:
                         normalized = _normalize_table_separators(response.text)
                         extracted.append(normalized)

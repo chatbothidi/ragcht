@@ -1,10 +1,7 @@
-"""Local chunk store for mapping Vector Search IDs back to chunk text/metadata."""
-
 import json
 from pathlib import Path
 
 from src.models import DocumentChunk
-
 
 class ChunkStore:
     def __init__(self, store_dir: str = "./data/chunk_store"):
@@ -22,7 +19,7 @@ class ChunkStore:
                 "page_number": chunk.page_number,
                 "section_title": chunk.section_title,
             }
-            # Add post metadata if available
+            # 게시물 메타데이터 추가
             if chunk.metadata:
                 if "post_id" in chunk.metadata:
                     entry["post_id"] = chunk.metadata["post_id"]
@@ -32,6 +29,8 @@ class ChunkStore:
                     entry["attachments"] = chunk.metadata["attachments"]
                 if chunk.metadata.get("year") is not None:
                     entry["year"] = chunk.metadata["year"]
+                if chunk.metadata.get("url"):
+                    entry["url"] = chunk.metadata["url"]
             self._chunks[chunk_id] = entry
         self._persist()
 

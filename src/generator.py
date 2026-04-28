@@ -1,7 +1,9 @@
 import asyncio
 import logging
 import random
+import time
 from collections.abc import AsyncGenerator
+from datetime import date
 
 import httpx
 from google import genai
@@ -48,7 +50,8 @@ SYSTEM_PROMPT = """당신은 의료 문서와 행사 문서를 기반으로 답�
     - 컨텍스트에 등장하는 순서를 무시하고 지정된 기준(날짜, 연도 등)으로 **모든 항목을 전부 정렬**하세요.
     - 앞쪽만 정렬하고 뒤쪽을 그대로 이어붙이는 실수를 하지 마세요.
     - 같은 행사(같은 게시글)는 한 번만 나열하고, 날짜/장소/주요 내용 정도로 간결히 요약하세요.
-    - 정렬 기준이 날짜인데 일/월까지 명시된 경우 일 단위까지 비교하세요. 연도만 있으면 연도로 비교하세요."""
+    - 정렬 기준이 날짜인데 일/월까지 명시된 경우 일 단위까지 비교하세요. 연도만 있으면 연도로 비교하세요.
+14. 컨텍스트의 청크 헤더에 `[원문: https://...]`이 포함되어 있으면, 답변 끝에 한 줄로 `자세한 내용은 [원문 보기](URL)에서 확인하실 수 있습니다.` 형식으로 자연스럽게 안내하세요. 같은 게시글의 청크가 여러 개여도 동일 URL은 한 번만 표시하세요. URL이 없으면 이 안내를 생략하세요."""
 
 MAX_CONTINUATION_ROUNDS = 3
 
@@ -57,7 +60,7 @@ async def _with_retry(
     coro_factory,
     *,
     label: str,
-    max_attempts: int = 5,
+    max_attempts: int = 3,
     initial_delay: float = 2.0,
 ):
     """Run an async callable with exponential backoff on retryable errors.
@@ -79,7 +82,7 @@ async def _with_retry(
                 isinstance(exc, genai_errors.ClientError)
                 and getattr(exc, "code", None) == 429
             )
-            base = max(delay, 20.0) if is_quota else delay
+            base = max(delay, 8.0) if is_quota else delay
             sleep_for = base + random.uniform(0, base * 0.25)
             logger.warning(
                 "[%s] %s on attempt %d/%d; retrying in %.1fs",
@@ -106,10 +109,12 @@ class LLMGenerator:
         self.max_context_tokens = settings.max_context_tokens
 
     def _config(self, temperature: float = 0.3) -> GenerateContentConfig:
+        today = date.today().isoformat()
+        system_instruction = f"오늘 날짜: {today}\n\n{SYSTEM_PROMPT}"
         return GenerateContentConfig(
             temperature=temperature,
             max_output_tokens=8192,
-            system_instruction=SYSTEM_PROMPT,
+            system_instruction=system_instruction,
             thinking_config=ThinkingConfig(thinking_budget=0),
         )
 
@@ -129,6 +134,8 @@ class LLMGenerator:
                 header += f" [연도: {doc['year']}]"
             if page:
                 header += f", 페이지 {page}"
+            if doc.get("url"):
+                header += f" [원문: {doc['url']}]"
 
             part = f"{header}\n{text}"
 
@@ -231,9 +238,57 @@ class LLMGenerator:
             label="generate-stream",
         )
 
+        start = time.monotonic()
+        first_chunk_at: float | None = None
+        chunk_count = 0
+        empty_chunk_count = 0
+        yielded_chars = 0
+        finish_reason: str | None = None
+        block_reason: str | None = None
+
         async for chunk in stream:
+            chunk_count += 1
+            if first_chunk_at is None:
+                first_chunk_at = time.monotonic() - start
+
+            try:
+                if chunk.candidates:
+                    fr = chunk.candidates[0].finish_reason
+                    if fr is not None:
+                        finish_reason = fr.name if hasattr(fr, "name") else str(fr)
+            except (AttributeError, IndexError):
+                pass
+
+            try:
+                pf = getattr(chunk, "prompt_feedback", None)
+                if pf and getattr(pf, "block_reason", None):
+                    br = pf.block_reason
+                    block_reason = br.name if hasattr(br, "name") else str(br)
+            except AttributeError:
+                pass
+
             if chunk.text:
+                yielded_chars += len(chunk.text)
                 yield chunk.text
+            else:
+                empty_chunk_count += 1
+
+        total_elapsed = time.monotonic() - start
+        first = first_chunk_at if first_chunk_at is not None else -1.0
+        if yielded_chars == 0:
+            logger.warning(
+                "[generate-stream] EMPTY response | chunks=%d empty=%d "
+                "first_chunk=%.2fs total=%.2fs finish_reason=%s block_reason=%s "
+                "ctx_len=%d query=%r",
+                chunk_count, empty_chunk_count, first, total_elapsed,
+                finish_reason, block_reason, len(context), query[:80],
+            )
+        else:
+            logger.info(
+                "[generate-stream] OK | chunks=%d chars=%d "
+                "first_chunk=%.2fs total=%.2fs finish_reason=%s",
+                chunk_count, yielded_chars, first, total_elapsed, finish_reason,
+            )
 
     @staticmethod
     def _get_finish_reason(response) -> str:
@@ -262,7 +317,12 @@ class LLMGenerator:
             for t in conversation_history[-4:]
         )
 
-        prompt = f"""이전 대화:
+        today_iso = date.today().isoformat()
+        current_year = date.today().year
+
+        prompt = f"""오늘 날짜: {today_iso} (현재 연도: {current_year}년)
+
+이전 대화:
 {history_text}
 
 현재 질문: {query}
@@ -271,9 +331,10 @@ class LLMGenerator:
 
 규칙:
 1. 대명사나 생략된 주어("그것", "거기서" 등)는 구체적으로 바꿔주세요.
-2. 단, 현재 질문에 특정 연도, 날짜, 조건이 명시되지 않았다면 이전 대화의 시간/조건을 강제로 추가하지 마세요.
-3. 현재 질문이 새로운 주제를 묻는 것이라면 이전 대화의 맥락을 적용하지 마세요.
-4. 리라이팅된 질문만 출력하세요."""
+2. "올해", "작년", "내년", "최근", "요즘" 같은 상대 시간 표현은 위에 명시된 오늘 날짜를 기준으로 절대 연도(예: "{current_year}년")로 변환하세요. 이전 대화에 등장한 연도가 아니라 반드시 오늘 날짜 기준으로 계산하세요.
+3. 단, 현재 질문에 특정 연도, 날짜, 조건이 명시되지 않았고 상대 시간 표현도 없다면 이전 대화의 시간/조건을 강제로 추가하지 마세요.
+4. 현재 질문이 새로운 주제를 묻는 것이라면 이전 대화의 맥락을 적용하지 마세요.
+5. 리라이팅된 질문만 출력하세요."""
 
         response = await _with_retry(
             lambda: self.client.aio.models.generate_content(

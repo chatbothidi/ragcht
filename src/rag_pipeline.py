@@ -1,5 +1,7 @@
 import logging
+import re
 from collections.abc import AsyncGenerator
+from datetime import date
 from typing import Any
 
 from google.genai import errors as genai_errors
@@ -19,11 +21,52 @@ GENERIC_FALLBACK_MESSAGE = (
     "답변 생성 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요."
 )
 
-
 def _fallback_message(exc: Exception) -> str:
     if isinstance(exc, genai_errors.ClientError) and getattr(exc, "code", None) == 429:
         return QUOTA_FALLBACK_MESSAGE
     return GENERIC_FALLBACK_MESSAGE
+
+
+def _normalize_relative_years(text: str) -> str:
+    """Replace Korean relative-year terms with absolute years based on today.
+
+    Longer terms first to avoid corrupting overlapping shorter terms
+    (예: "재작년" contains "작년").
+    """
+    current_year = date.today().year
+    replacements = [
+        ("재작년", current_year - 2),
+        ("내후년", current_year + 2),
+        ("지난해", current_year - 1),
+        ("올해", current_year),
+        ("금년", current_year),
+        ("작년", current_year - 1),
+        ("내년", current_year + 1),
+        ("명년", current_year + 1),
+    ]
+    for term, year in replacements:
+        text = text.replace(term, f"{year}년")
+    return text
+
+
+_SELF_CONTAINED_YEAR = re.compile(r"\b(19|20|21|22|23|24|25|26)\d{2}\b")
+_SELF_CONTAINED_EVENT = re.compile(
+    r"(Workshop|workshop|School|school|Symposium|symposium|"
+    r"심포지엄|학술대회|연수강좌|워크숍|컨퍼런스|세미나|학회)"
+)
+_FOLLOWUP_PRONOUN = re.compile(r"(그것|그거|그 행사|그 학회|거기|이번|지난번|방금|아까|위에|이전)")
+
+
+def _is_self_contained(text: str) -> bool:
+    """Return True when the query has explicit topic markers and no follow-up
+    pronouns — meaning prior conversation history is more likely to harm than
+    help. Used to bypass rewrite_query and clear history for those queries.
+    """
+    if _FOLLOWUP_PRONOUN.search(text):
+        return False
+    has_year = bool(_SELF_CONTAINED_YEAR.search(text))
+    has_event = bool(_SELF_CONTAINED_EVENT.search(text))
+    return has_year or has_event
 
 
 class RAGPipeline:
@@ -45,16 +88,20 @@ class RAGPipeline:
         session_id: str | None = None,
         source_type_filter: str | None = None,
     ) -> RAGResponse:
-        """Execute full RAG pipeline."""
+        """Full RAG pipeline."""
         if not session_id:
             session_id = self.memory.create_session()
 
         history = await self.memory.get_history(session_id)
 
+        normalized_question = _normalize_relative_years(question)
+        self_contained = _is_self_contained(normalized_question)
+        effective_history = None if self_contained else history
+
         rewritten_query = None
-        search_query = question
-        if history:
-            rewritten_query = await self.generator.rewrite_query(question, history)
+        search_query = normalized_question
+        if effective_history:
+            rewritten_query = await self.generator.rewrite_query(normalized_question, effective_history)
             search_query = rewritten_query
 
         documents = await self.retriever.retrieve(
@@ -77,7 +124,7 @@ class RAGPipeline:
         answer = await self.generator.generate(
             query=search_query,
             context=context,
-            conversation_history=history,
+            conversation_history=effective_history,
         )
 
         await self.memory.add_turn(session_id, question, answer)
@@ -114,16 +161,21 @@ class RAGPipeline:
         try:
             history = await self.memory.get_history(session_id)
 
+            normalized_question = _normalize_relative_years(question)
+            self_contained = _is_self_contained(normalized_question)
+            effective_history = None if self_contained else history
+
             rewritten_query = None
-            search_query = question
-            if history:
-                rewritten_query = await self.generator.rewrite_query(question, history)
+            search_query = normalized_question
+            if effective_history:
+                rewritten_query = await self.generator.rewrite_query(normalized_question, effective_history)
                 search_query = rewritten_query
 
             documents = await self.retriever.retrieve(
                 query=search_query,
                 source_type_filter=source_type_filter,
             )
+
         except Exception as exc:
             logger.exception("query_stream setup failed")
             msg = _fallback_message(exc)
@@ -132,6 +184,10 @@ class RAGPipeline:
             return
 
         if not documents:
+            logger.warning(
+                "[query_stream] NO documents retrieved | query=%r rewritten=%r filter=%r session=%s",
+                question[:80], rewritten_query, source_type_filter, session_id,
+            )
             yield {"type": "token", "content": "제공된 문서에서 관련 정보를 찾을 수 없습니다."}
             yield {"type": "done", "session_id": session_id}
             return
@@ -144,7 +200,7 @@ class RAGPipeline:
             async for token in self.generator.generate_stream(
                 query=search_query,
                 context=context,
-                conversation_history=history,
+                conversation_history=effective_history,
             ):
                 full_answer.append(token)
                 yield {"type": "token", "content": token}
@@ -153,7 +209,6 @@ class RAGPipeline:
             stream_failed = exc
 
         if stream_failed is not None or not full_answer:
-            # Either the LLM raised, or yielded no text at all.
             msg = _fallback_message(stream_failed) if stream_failed else GENERIC_FALLBACK_MESSAGE
             if not full_answer:
                 yield {"type": "token", "content": msg}

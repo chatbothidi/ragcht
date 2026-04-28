@@ -1,3 +1,4 @@
+import hashlib
 import pickle
 from pathlib import Path
 
@@ -6,12 +7,11 @@ from rank_bm25 import BM25Okapi
 
 from src.models import DocumentChunk
 
-# Content morpheme tags (nouns, verbs, adjectives)
+# 단어종류 (명사, 동사, 형용사)
 CONTENT_TAGS = {"NNG", "NNP", "NNB", "VV", "VA", "MAG"}
 
-# Korean stopwords
+# 한국어 불용어
 STOPWORDS = {"하다", "있다", "되다", "이다", "것", "수", "등", "및", "또는", "그", "이", "저"}
-
 
 class BM25Index:
     def __init__(self, index_dir: str = "./data/bm25_index"):
@@ -21,6 +21,8 @@ class BM25Index:
         self.chunk_ids: list[str] = []
         self.chunk_texts: list[str] = []
         self.chunk_metadata: list[dict] = []
+        # 텍스트 hash -> 토큰 리스트. 변경 없는 청크는 재토큰화 스킵.
+        self._token_cache: dict[str, list[str]] = {}
 
     def tokenize(self, text: str) -> list[str]:
         """Korean morphological tokenization for BM25."""
@@ -45,11 +47,24 @@ class BM25Index:
                 "post_id": (c.metadata or {}).get("post_id"),
                 "post_title": (c.metadata or {}).get("post_title"),
                 "year": (c.metadata or {}).get("year"),
+                "url": (c.metadata or {}).get("url"),
             }
             for c in chunks
         ]
 
-        tokenized = [self.tokenize(text) for text in self.chunk_texts]
+        # 토큰화 캐시 사용 — 같은 텍스트는 다시 Kiwi에 돌리지 않음.
+        # 새 캐시를 만들면서 이번 build에 등장한 키만 살리므로 삭제된 청크는 자동 prune.
+        new_cache: dict[str, list[str]] = {}
+        tokenized: list[list[str]] = []
+        for text in self.chunk_texts:
+            key = hashlib.md5(text.encode("utf-8")).hexdigest()
+            tokens = new_cache.get(key) or self._token_cache.get(key)
+            if tokens is None:
+                tokens = self.tokenize(text)
+            new_cache[key] = tokens
+            tokenized.append(tokens)
+        self._token_cache = new_cache
+
         if not tokenized:
             self.bm25 = None
             return
@@ -68,7 +83,7 @@ class BM25Index:
         tokenized_query = self.tokenize(query)
         scores = self.bm25.get_scores(tokenized_query)
 
-        # Create scored results
+        # 점수 계산 결과
         results = []
         for idx, score in enumerate(scores):
             if score <= 0:
@@ -87,6 +102,7 @@ class BM25Index:
                     "post_id": meta.get("post_id"),
                     "post_title": meta.get("post_title"),
                     "year": meta.get("year"),
+                    "url": meta.get("url"),
                 }
             )
 
@@ -101,6 +117,7 @@ class BM25Index:
             "chunk_texts": self.chunk_texts,
             "chunk_metadata": self.chunk_metadata,
             "bm25": self.bm25,
+            "token_cache": self._token_cache,
         }
         with open(self.index_dir / "bm25_index.pkl", "wb") as f:
             pickle.dump(data, f)
@@ -118,4 +135,6 @@ class BM25Index:
         self.chunk_texts = data["chunk_texts"]
         self.chunk_metadata = data["chunk_metadata"]
         self.bm25 = data["bm25"]
+        # 이전 버전 pkl과의 호환을 위해 get으로 안전하게 로드.
+        self._token_cache = data.get("token_cache", {})
         return True

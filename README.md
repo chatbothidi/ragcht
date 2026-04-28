@@ -4,15 +4,15 @@ RAG 챗봇 시스템입니다.
 
 ## 기술 스택
 
-- **LLM**: Vertex AI Gemini 2.5 Flash (google-genai SDK, thinking 비활성화)
-- **임베딩**: text-multilingual-embedding-002 (768차원)
-- **벡터 스토어**: Vertex AI Vector Search
-- **리랭킹**: Discovery Engine Ranking API (semantic-ranker-default)
-- **한국어 형태소**: kiwipiepy
-- **검색**: 2단계 하이브리드 (Vector Search + BM25 + RRF → Rerank)
-- **API**: FastAPI + SSE 스트리밍
-- **대화 메모리**: Redis
-- **OCR**: Google Document AI (스캔 PDF), Gemini Vision (이미지 파일/URL)
+- LLM: Vertex AI Gemini 2.5 Flash (google-genai SDK, thinking 비활성화)
+- 임베딩: text-multilingual-embedding-002 (768차원)
+- 벡터 스토어: Vertex AI Vector Search
+- 리랭킹: Discovery Engine Ranking API (semantic-ranker-default)
+- 한국어 형태소: kiwipiepy
+- 검색: 2단계 하이브리드 (Vector Search + BM25 + RRF → Rerank)
+- API: FastAPI + SSE 스트리밍
+- 대화 메모리: Redis
+- OCR: Google Document AI (스캔 PDF), Gemini Vision (이미지 파일/URL)
 
 ## 검색 파이프라인
 
@@ -158,9 +158,9 @@ uvicorn api.main:app --host 0.0.0.0 --port 8000 &
 
 ```json
 {
-  "query": "LCK 2026행사 일정을 알려줘",
+  "query": "2026행사 일정을 알려줘",
   "session_id": "optional-session-id",
-  "source_type_filter": "Esport",
+  "source_type_filter": "event",
   "stream": true
 }
 ```

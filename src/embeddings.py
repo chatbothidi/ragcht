@@ -50,7 +50,7 @@ class EmbeddingService:
         self,
         contents: list[str],
         task_type: str,
-        max_attempts: int = 6,
+        max_attempts: int = 3,
         initial_delay: float = 2.0,
     ) -> types.EmbedContentResponse:
         """Call Vertex AI embedding API via google-genai with exponential backoff."""
@@ -73,7 +73,7 @@ class EmbeddingService:
                     isinstance(exc, genai_errors.ClientError)
                     and getattr(exc, "code", None) == 429
                 )
-                base = max(delay, 20.0) if is_quota else delay
+                base = max(delay, 8.0) if is_quota else delay
                 sleep_for = base + random.uniform(0, base * 0.25)
                 logger.warning(
                     "[embed] %s on attempt %d/%d; retrying in %.1fs",

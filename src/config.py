@@ -1,7 +1,6 @@
 from pydantic_settings import BaseSettings
 from functools import lru_cache
 
-
 class Settings(BaseSettings):
     # GCP
     gcp_project_id: str
@@ -12,11 +11,14 @@ class Settings(BaseSettings):
     llm_model: str = "gemini-2.0-flash"
     llm_location: str | None = None
 
+    # Document AI OCR
+    docai_processor: str
+
     # Vector Search — Firestore Vector Search (serverless)
     firestore_database_id: str = "(default)"
     firestore_collection_name: str = "medical_event_chunks"
 
-    # Legacy Vertex AI Vector Search (Matching Engine) — kept for backward compat / rollback
+    # Legacy Vertex AI Vector Search (Matching Engine)
     vertex_collection_name: str = "medical_event_docs"
     vertex_index_id: str | None = None
     vertex_endpoint_id: str | None = None
@@ -37,10 +39,10 @@ class Settings(BaseSettings):
     # Conversation
     max_conversation_turns: int = 5
 
-    # Redis (required — used for session memory and embedding cache)
+    # Redis (세션메모리 저장과 임베딩 캐싱을 위함)
     redis_url: str | None = None
 
-    # Embedding cache TTL in seconds (7 days default)
+    # Embedding cache TTL (7 days default)
     embedding_cache_ttl: int = 7 * 24 * 3600
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}

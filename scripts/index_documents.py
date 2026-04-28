@@ -14,6 +14,8 @@ import json
 import sys
 from pathlib import Path
 
+from redis.asyncio import Redis
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.bm25_index import BM25Index
@@ -173,6 +175,7 @@ async def incremental_index(loader, chunker, embeddings, vectorstore, chunk_stor
             attachments = metadata.get("attachments", [])
             all_supported = loader.SUPPORTED_EXTENSIONS | loader.IMAGE_EXTENSIONS
             year = metadata.get("year")
+            url = metadata.get("url")
 
             main_path = post_dir / main_file
             if main_path.exists() and main_path.suffix.lower() in all_supported:
@@ -180,7 +183,7 @@ async def incremental_index(loader, chunker, embeddings, vectorstore, chunk_stor
                     doc = loader.load_file(
                         str(main_path), category,
                         post_id=metadata.get("id"), post_title=title,
-                        attachments=attachments, year=year,
+                        attachments=attachments, year=year, url=url,
                     )
                     documents.append(doc)
                 except Exception as e:
@@ -193,7 +196,7 @@ async def incremental_index(loader, chunker, embeddings, vectorstore, chunk_stor
                         doc = loader.load_file(
                             str(att_path), category,
                             post_id=metadata.get("id"), post_title=title,
-                            year=year,
+                            year=year, url=url,
                         )
                         documents.append(doc)
                     except Exception as e:
@@ -265,6 +268,7 @@ async def add_post(post_id, loader, chunker, embeddings, vectorstore, chunk_stor
 
     loader._load_image_cache(post_dir)
     year = metadata.get("year")
+    url = metadata.get("url")
 
     documents = []
     main_path = post_dir / main_file
@@ -272,7 +276,7 @@ async def add_post(post_id, loader, chunker, embeddings, vectorstore, chunk_stor
         doc = loader.load_file(
             str(main_path), category,
             post_id=metadata.get("id"), post_title=title,
-            attachments=attachments, year=year,
+            attachments=attachments, year=year, url=url,
         )
         documents.append(doc)
 
@@ -282,7 +286,7 @@ async def add_post(post_id, loader, chunker, embeddings, vectorstore, chunk_stor
             doc = loader.load_file(
                 str(att_path), category,
                 post_id=metadata.get("id"), post_title=title,
-                year=year,
+                year=year, url=url,
             )
             documents.append(doc)
 
@@ -336,10 +340,19 @@ async def _main_async(args):
 
     loader = DocumentLoader()
     chunker = DocumentChunker(settings)
-    embeddings = EmbeddingService(settings)
     vectorstore = VectorStore(settings)
     chunk_store = ChunkStore()
     bm25 = BM25Index()
+
+    # add/delete 전용 가속: 임베딩 Redis 캐시 + BM25 토큰 캐시 로드.
+    # full은 의도적으로 영향 안 받게 둠.
+    redis_client: Redis | None = None
+    if (args.add or args.delete) and settings.redis_url:
+        redis_client = Redis.from_url(settings.redis_url, decode_responses=True)
+    if args.add or args.delete:
+        bm25.load()
+
+    embeddings = EmbeddingService(settings, redis_client=redis_client)
 
     try:
         if args.add:
@@ -356,6 +369,8 @@ async def _main_async(args):
             await incremental_index(loader, chunker, embeddings, vectorstore, chunk_store, bm25, doc_dir)
     finally:
         await vectorstore.close()
+        if redis_client is not None:
+            await redis_client.aclose()
 
 
 def main():

@@ -118,6 +118,7 @@ cp .env.example .env
 | `EMBEDDING_MODEL` | - | 임베딩 모델 (기본: text-multilingual-embedding-002) |
 | `LLM_MODEL` | - | LLM 모델 (기본: gemini-2.0-flash) |
 | `LLM_LOCATION` | - | LLM 전용 리전 (기본: GCP_LOCATION과 동일) |
+| `DOCAI_PROCESSOR` | **O** | Document AI OCR 프로세서 리소스 경로 (`projects/{number}/locations/{loc}/processors/{id}`) |
 | `FIRESTORE_DATABASE_ID` | - | Firestore DB ID (기본: `(default)`) |
 | `FIRESTORE_COLLECTION_NAME` | - | 벡터 저장 컬렉션 이름 (기본: medical_event_chunks) |
 | `VERTEX_INDEX_ID` | (legacy) | Vector Search 인덱스 — Firestore 전환 후 미사용, rollback 용 |
@@ -582,6 +583,7 @@ pytest tests/ --cov=src --cov-report=term-missing
 - **`query_stream()` (rag_pipeline.py)**: setup 구간과 스트림 iteration 모두 `try/except` 로 감싸져 있습니다. 예외 발생 시 `_fallback_message()` 가 429 여부를 보고 적절한 한국어 메시지를 스트림 토큰으로 yield 합니다 (`QUOTA_FALLBACK_MESSAGE` / `GENERIC_FALLBACK_MESSAGE`).
 - **`_stream_response()` (chat.py)**: 파이프라인이 항상 토큰을 yield 하도록 보장되므로 라우트 계층의 try/except 는 불필요.
 - **빈 스트림 (토큰 0개) 방어**: `full_answer == []` 인 경우에도 `GENERIC_FALLBACK_MESSAGE` 를 yield 해서 프론트엔드가 빈 응답으로 멈추지 않도록 함.
+- **진단 로그**: `generator.generate_stream` 이 종료 시 한 줄로 `chunks/empty/first_chunk/total/finish_reason/block_reason/ctx_len/query` 를 INFO/WARNING 로 남깁니다. 빈 응답이 발생하면 `docker logs --tail 50 infra-app-1 | grep generate-stream` 로 cold-start, safety filter, quota, finish_reason 비정상 종료 등을 즉시 식별 가능. retrieve 가 빈 결과면 `[query_stream] NO documents retrieved` WARNING 도 함께 남음.
 
 ### 파일명 특수문자
 

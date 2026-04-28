@@ -6,7 +6,6 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from src.config import Settings
 from src.models import DocumentChunk, LoadedDocument
 
-
 class DocumentChunker:
     # 의료지침서 관련 섹션 헤더
     MEDICAL_HEADERS = re.compile(
@@ -41,7 +40,7 @@ class DocumentChunker:
         return all_chunks
 
     def _chunk_medical(self, document: LoadedDocument) -> list[DocumentChunk]:
-        """Hierarchical chunking: 섹션 헤더 → 문장 범위"""
+        """계층적 chunking: 섹션 헤더 → 문장 범위."""
         sections = self._split_by_sections(document.text)
         chunks = []
 
@@ -89,7 +88,7 @@ class DocumentChunker:
         ]
 
     def _split_by_sections(self, text: str) -> list[tuple[str | None, str]]:
-        """Split text by medical section headers."""
+        """의료 섹션 헤더 기준으로 텍스트 분할."""
         matches = list(self.MEDICAL_HEADERS.finditer(text))
 
         if not matches:
@@ -112,7 +111,7 @@ class DocumentChunker:
         return sections
 
     def _split_sentences(self, text: str) -> list[str]:
-        """Split text into sentences using kiwipiepy."""
+        """kiwipiepy로 텍스트를 문장 단위로 분할."""
         result = self.kiwi.split_into_sents(text)
         return [sent.text.strip() for sent in result if sent.text.strip()]
 
@@ -122,7 +121,7 @@ class DocumentChunker:
         max_chars: int,
         overlap_chars: int,
     ) -> list[str]:
-        """Group sentences into chunks with overlap at sentence boundaries."""
+        """문장 경계에서 overlap을 두고 문장들을 청크로 그룹화."""
         if not sentences:
             return []
 
@@ -136,7 +135,7 @@ class DocumentChunker:
             if current_len + sent_len > max_chars and current_sentences:
                 chunks.append(" ".join(current_sentences))
 
-                # Calculate overlap: keep last sentences within overlap_chars
+                # overlap 계산: overlap_chars 범위 내에서 마지막 문장들 유지
                 overlap_sentences: list[str] = []
                 overlap_len = 0
                 for s in reversed(current_sentences):
@@ -159,7 +158,7 @@ class DocumentChunker:
     def _estimate_page(
         self, document: LoadedDocument, chunk_text: str
     ) -> int | None:
-        """Estimate page number for a chunk based on PDF pages."""
+        """PDF 페이지를 기반으로 청크의 페이지 번호 추정."""
         if not document.pages:
             return None
 

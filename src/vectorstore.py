@@ -1,10 +1,4 @@
-"""Firestore Vector Search backend.
-
-Replaces the prior Vertex AI Vector Search (Matching Engine) implementation
-with a serverless, pay-per-query Firestore collection that supports native
-KNN via `find_nearest`. The public interface (`upsert`, `search`) is preserved
-so `HybridRetriever` and `scripts/index_documents.py` keep working unchanged.
-"""
+"""Firestore Vector Search 백엔드."""
 import logging
 import uuid
 
@@ -18,11 +12,11 @@ from src.models import DocumentChunk
 
 logger = logging.getLogger(__name__)
 
-_BATCH_SIZE = 500  # Firestore batch write limit
+_BATCH_SIZE = 500
 
 
 class VectorStore:
-    """Firestore Vector Search backend."""
+    """Firestore Vector Search 백엔드."""
 
     EMBEDDING_DIM = 768  # text-multilingual-embedding-002
 
@@ -40,7 +34,7 @@ class VectorStore:
         chunks: list[DocumentChunk],
         embeddings: list[list[float]],
     ) -> list[str]:
-        """Upsert vectors + chunk metadata into Firestore. Returns document IDs."""
+        """벡터 + 청크 메타데이터를 Firestore에 upsert. 문서 ID 목록 반환."""
         if len(chunks) != len(embeddings):
             raise ValueError(
                 f"chunks ({len(chunks)}) and embeddings ({len(embeddings)}) length mismatch"
@@ -67,7 +61,6 @@ class VectorStore:
             if chunk.section_title:
                 data["section_title"] = chunk.section_title
             if chunk.metadata:
-                # Flatten common metadata fields for querying
                 meta = chunk.metadata
                 if meta.get("post_id") is not None:
                     data["post_id"] = meta["post_id"]
@@ -99,7 +92,7 @@ class VectorStore:
         top_k: int = 10,
         source_type_filter: str | None = None,
     ) -> list[dict]:
-        """KNN search via Firestore find_nearest. Returns list of dicts with id, score, and chunk fields."""
+        """Firestore find_nearest를 통한 KNN 검색. id, score, 청크 필드를 가진 dict 리스트 반환."""
         q = self._collection()
         if source_type_filter:
             q = q.where(filter=FieldFilter("source_type", "==", source_type_filter))
@@ -116,18 +109,18 @@ class VectorStore:
         async for snap in vq.stream():
             d = snap.to_dict() or {}
             distance = d.pop("distance", 0.0)
-            d.pop("embedding", None)  # Don't ship embedding vector to caller
+            d.pop("embedding", None)
             results.append(
                 {
                     "id": snap.id,
-                    "score": 1.0 - float(distance),  # cosine similarity
+                    "score": 1.0 - float(distance),  # cosine 유사도
                     **d,
                 }
             )
         return results
 
     async def remove(self, ids: list[str]) -> int:
-        """Delete documents by IDs. Returns number removed."""
+        """ID로 문서 삭제. 삭제된 개수 반환."""
         if not ids:
             return 0
         removed = 0
@@ -146,7 +139,6 @@ class VectorStore:
         return removed
 
     async def close(self):
-        # AsyncClient has a close() coroutine in newer versions; ignore if missing
         close_fn = getattr(self.client, "close", None)
         if close_fn is not None:
             result = close_fn()

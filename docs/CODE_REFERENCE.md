@@ -45,6 +45,7 @@ pydantic-settings 기반. `.env` 파일을 자동으로 읽습니다.
 | `embedding_model` | str | "text-multilingual-embedding-002" | 임베딩 모델명 |
 | `llm_model` | str | "gemini-2.0-flash" | LLM 모델명 |
 | `llm_location` | str \| None | None | LLM 전용 리전 (미설정 시 `gcp_location` 사용) |
+| `docai_processor` | str | (필수) | Document AI OCR 프로세서 리소스 경로 (`projects/{number}/locations/{loc}/processors/{id}`) |
 | `vertex_collection_name` | str | "medical_event_docs" | Vector Search 컬렉션명 |
 | `vertex_index_id` | str \| None | None | Vector Search 인덱스 리소스 ID |
 | `vertex_endpoint_id` | str \| None | None | Vector Search 엔드포인트 리소스 ID |
@@ -139,8 +140,9 @@ pydantic-settings 기반. `.env` 파일을 자동으로 읽습니다.
 |------|---|------|
 | `SUPPORTED_EXTENSIONS` | `.pdf, .docx, .doc, .txt, .md` | 지원 문서 확장자 |
 | `IMAGE_EXTENSIONS` | `.jpg, .jpeg, .png, .gif, .webp, .bmp` | 지원 이미지 확장자 |
-| `DOCAI_PROCESSOR` | 프로세서 리소스 경로 | Document AI OCR 프로세서 ID |
 | `CACHE_FILENAME` | `.image_cache.json` | 게시글 폴더별 캐시 파일명 |
+
+> Document AI OCR 프로세서 경로는 더 이상 클래스 상수가 아니라 `Settings.docai_processor` (`.env`의 `DOCAI_PROCESSOR`) 에서 로드합니다. `_ensure_docai_client()` 가 첫 호출 시 settings 를 읽어 클라이언트와 프로세서 경로를 lazy 초기화합니다.
 
 #### 주요 메서드
 
@@ -176,6 +178,13 @@ pydantic-settings 기반. `.env` 파일을 자동으로 읽습니다.
 
 **`_load_docx(path, source_type)`**
 - `python-docx`로 단락 추출, 빈 단락 제외
+
+#### 클라이언트 lazy 초기화
+
+| 메서드 | 설명 |
+|--------|------|
+| `_ensure_genai_client()` | 생성자에서 `genai_client` 가 주입되지 않은 경우, 첫 호출 시 settings 로 Vertex genai 클라이언트와 `_llm_model` 을 lazy 생성 |
+| `_ensure_docai_client()` | 첫 호출 시 settings 로 Document AI 클라이언트와 `_docai_processor` (프로세서 경로) 를 lazy 생성 |
 
 #### 캐싱 시스템
 
@@ -567,6 +576,7 @@ LLM의 동작을 제어하는 한국어 규칙 **13개**:
 - `self.client.aio.models.generate_content_stream(...)` 사용, 초기 호출을 `_with_retry` 로 래핑
 - 각 청크의 `.text`가 None이 아닌 경우만 yield
 - 연속 생성(MAX_TOKENS 처리) 없음 (스트리밍은 첫 청크 이후 재시도 불가)
+- **진단 로그**: 스트림 종료 시 한 줄 로그 (`[generate-stream] OK ...` 또는 빈 응답 시 `EMPTY response ...`). 필드: `chunks` / `empty` / `first_chunk` (첫 청크까지 latency 초) / `total` (전체 소요 초) / `finish_reason` (STOP, SAFETY, RECITATION, MAX_TOKENS 등) / `block_reason` (prompt-level safety block) / `ctx_len` / `query`. 빈 응답 디버깅 시 이 한 줄로 cold-start vs safety filter vs quota 를 식별 가능
 
 #### `async rewrite_query(query, conversation_history)`
 - 멀티턴 대화에서 현재 질문을 독립적으로 이해 가능하게 리라이팅
@@ -656,7 +666,7 @@ A. setup 블록(try/except):
    4. HybridRetriever.retrieve
    → 예외 시 _fallback_message(exc) 토큰 + done yield 후 종료
 
-B. 결과 없으면 → "관련 정보를 찾을 수 없습니다." 토큰 + done yield 후 종료
+B. 결과 없으면 → WARNING 로그 (`[query_stream] NO documents retrieved | query=... rewritten=... filter=... session=...`) + "관련 정보를 찾을 수 없습니다." 토큰 + done yield 후 종료
 
 C. 스트리밍 생성(try/except):
    async for token in generator.generate_stream(...):
