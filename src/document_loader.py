@@ -348,33 +348,48 @@ class DocumentLoader:
         return document.text, pages
 
     def _ocr_pdf_chunked(self, path: Path, total_pages: int, chunk_size: int = 15) -> tuple[str, list[dict]]:
-        """큰 PDF를 30페이지 단위로 분할해 OCR 처리."""
-        all_text_parts = []
-        all_pages = []
+        """큰 PDF를 페이지 + 사이즈 제한에 맞게 분할해 OCR 처리.
+
+        Document AI 한도: 페이지 ≤15, raw 사이즈 ≤40MB. 페이지 분할만으론 사이즈 초과
+        발생 가능(이미지 많은 PDF). 사이즈 초과 시 재귀적으로 절반 분할.
+        """
+        DOCAI_MAX_BYTES = 40 * 1024 * 1024  # 41943040 한도에 안전 마진
+        all_text_parts: list[str] = []
+        all_pages: list[dict] = []
 
         doc = fitz.open(str(path))
 
-        for start in range(0, total_pages, chunk_size):
-            end = min(start + chunk_size, total_pages)
-            print(f"    Pages {start + 1}-{end}...")
-
-            # 페이지 범위를 임시 PDF로 추출
+        def _extract_chunk_bytes(start: int, end: int) -> bytes:
             chunk_doc = fitz.open()
             chunk_doc.insert_pdf(doc, from_page=start, to_page=end - 1)
             chunk_bytes = chunk_doc.tobytes()
             chunk_doc.close()
+            return chunk_bytes
 
-            # 해당 청크 OCR 처리
+        def _process_range(start: int, end: int) -> None:
+            chunk_bytes = _extract_chunk_bytes(start, end)
+            size_mb = len(chunk_bytes) // (1024 * 1024)
+
+            # 사이즈 초과 + 분할 가능하면 재귀
+            if len(chunk_bytes) > DOCAI_MAX_BYTES and (end - start) > 1:
+                mid = (start + end) // 2
+                print(f"    Pages {start + 1}-{end}: {size_mb}MB exceeds limit, splitting at {mid + 1}")
+                _process_range(start, mid)
+                _process_range(mid, end)
+                return
+
+            print(f"    Pages {start + 1}-{end} ({size_mb}MB)...")
             text, pages = self._ocr_pdf_bytes(chunk_bytes)
-
             all_text_parts.append(text)
-            # 페이지 번호 조정
             for page in pages:
                 page["page"] += start
             all_pages.extend(pages)
 
-        doc.close()
+        for start in range(0, total_pages, chunk_size):
+            end = min(start + chunk_size, total_pages)
+            _process_range(start, end)
 
+        doc.close()
         return "\n\n".join(all_text_parts), all_pages
 
     def _extract_page_text(self, full_text: str, page) -> str:

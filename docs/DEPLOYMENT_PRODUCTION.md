@@ -14,7 +14,7 @@
 
 ```
 [A] 자체 UI 경로
-브라우저 ── https://api.lungkorea.org/ ──> Apache ── 127.0.0.1:8001 (RAG)
+브라우저 ── https://api.lungkorea.org/ ──> Apache ── 127.0.0.1:8000(RAG)
 
 [B] Laravel 챗봇 경로 (기존 도메인은 어디든 그대로 둠)
 브라우저 ── 기존 챗봇 blade UI ──> Laravel /api/chatbot/send
@@ -25,7 +25,7 @@
 도메인은 `api.lungkorea.org` 하나만. Laravel은 현재 위치 그대로 두고 `.env`의 `RAG_API_URL`만 가리키면 됨.
 
 핵심 원칙:
-- RAG는 **localhost에만 노출** (`127.0.0.1:8001`).
+- RAG는 **localhost에만 노출** (`127.0.0.1:8000`).
 - Apache가 80/443에서 외부 트래픽 받아 RAG로 프록시.
 - Rocky 9 특성상 SELinux와 firewalld 설정이 필수.
 
@@ -71,7 +71,7 @@ sudo firewall-cmd --reload
 sudo firewall-cmd --list-all
 ```
 
-8001은 외부에 절대 열지 않음. Apache가 localhost로만 접속.
+8000은 외부에 절대 열지 않음. Apache가 localhost로만 접속.
 
 ### 1.4 SELinux — Rocky 9에서 자주 막히는 지점
 
@@ -168,7 +168,7 @@ services:
       context: ..
       dockerfile: infra/Dockerfile
     ports:
-      - "127.0.0.1:8001:8000"
+      - "127.0.0.1:8000:8000"
     env_file: ../.env
     environment:
       - PYTHONUNBUFFERED=1
@@ -240,11 +240,11 @@ docker compose logs app -f
 `Pipeline ready.` 보이면 정상.
 
 ```bash
-curl -s http://127.0.0.1:8001/admin/health
+curl -s http://127.0.0.1:8000/admin/health
 # → {"status":"ok"}
 ```
 
-이 시점에 외부 IP로 8001 직접 접속은 의도적으로 안 됨.
+이 시점에 외부 IP로 8000 직접 접속은 의도적으로 안 됨.
 
 ---
 
@@ -275,8 +275,8 @@ httpd -M | grep -E "proxy|headers|ssl"
     ProxyPreserveHost On
 
     # SSE 즉시 송신 핵심 옵션
-    ProxyPass        / http://127.0.0.1:8001/ flushpackets=on timeout=300 keepalive=On
-    ProxyPassReverse / http://127.0.0.1:8001/
+    ProxyPass        / http://127.0.0.1:8000/ flushpackets=on timeout=300 keepalive=On
+    ProxyPassReverse / http://127.0.0.1:8000/
 
     SetEnv proxy-sendchunked 1
     RequestHeader set X-Forwarded-Proto "http"
@@ -339,7 +339,7 @@ sudo certbot --apache -d api.lungkorea.org \
 sudo cat /etc/httpd/conf.d/api.lungkorea.org-le-ssl.conf
 ```
 
-여기서 7.2의 `ProxyPass / http://127.0.0.1:8001/ flushpackets=on ...` 라인이 그대로 있어야 합니다. 빠져있으면 추가하고 `sudo systemctl restart httpd`.
+여기서 7.2의 `ProxyPass / http://127.0.0.1:8000/ flushpackets=on ...` 라인이 그대로 있어야 합니다. 빠져있으면 추가하고 `sudo systemctl restart httpd`.
 
 확인:
 ```bash
@@ -414,7 +414,7 @@ php artisan config:clear
 | `http://api.lungkorea.org/admin/health` → 503 | mod_proxy 모듈 미로드, 또는 SELinux `httpd_can_network_connect` 미설정 |
 | 503 + `Permission denied: AH00957` 로그 | SELinux. `sudo setsebool -P httpd_can_network_connect 1` |
 | HTTPS 적용 후 SSE가 묶여서 도착 | certbot이 HTTPS vhost에 ProxyPass 옵션 누락. 7.2의 `flushpackets=on` 라인 추가 |
-| `Connection refused (8001)` | docker 컨테이너 미기동. `docker compose ps` 확인 |
+| `Connection refused (8000)` | docker 컨테이너 미기동. `docker compose ps` 확인 |
 | Vertex AI 401/403 | `/etc/secrets/sa-key.json` 권한 또는 SA 역할 부족 |
 | Vertex AI 429 | quota 초과. Console에서 증액 신청 또는 모델 다운그레이드(`gemini-2.5-flash-lite`) |
 | `RuntimeError: REDIS_URL is required` | redis 컨테이너 미기동 또는 `.env` 누락 |
@@ -429,7 +429,7 @@ php artisan config:clear
 한 번에 다 하지 말고 단계별로 검증하면서:
 
 1. **세션 1 — 서버 준비**: Phase 1 ~ 4
-   - 검증: `docker compose ps` + `curl http://127.0.0.1:8001/admin/health`
+   - 검증: `docker compose ps` + `curl http://127.0.0.1:8000/admin/health`
 2. **세션 2 — 데이터 + Apache**: Phase 5 ~ 7
    - 검증: `curl http://api.lungkorea.org/admin/health` + SSE 테스트
 3. **세션 3 — TLS + 통합**: Phase 8 ~ 10

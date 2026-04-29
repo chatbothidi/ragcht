@@ -12,6 +12,23 @@ from src.vectorstore import VectorStore
 
 logger = logging.getLogger(__name__)
 
+# 질의에서 연/월 의도 추출 (한국어 "년", "월" suffix 명시 매칭).
+_TIME_INTENT_YEAR = re.compile(r"(20\d{2})\s*년")
+_TIME_INTENT_MONTH = re.compile(r"(?<!\d)(\d{1,2})\s*월")
+
+
+def _extract_time_intent(query: str) -> dict:
+    """Query에서 year(int)와 months(list[int]) 추출. 없으면 None/[].
+
+    "2026년 3월" → {year: 2026, months: [3]}
+    "2025년" → {year: 2025, months: []}
+    "1월부터 3월까지" → {year: None, months: [1, 3]}
+    """
+    year_match = _TIME_INTENT_YEAR.search(query)
+    year = int(year_match.group(1)) if year_match else None
+    months = [int(m) for m in _TIME_INTENT_MONTH.findall(query) if 1 <= int(m) <= 12]
+    return {"year": year, "months": months}
+
 class HybridRetriever:
     RRF_K = 60  # 표준 RRF 상수
     _RECENCY_PATTERN = re.compile(r"(최근|최신|요즘|올해|금년|이번\s*해)")
@@ -67,6 +84,11 @@ class HybridRetriever:
             query, candidates, top_n=final_k, recency_boost=is_recency or is_sort
         )
 
+        # 시간 의도 부스트 — query에 명시적 year/month가 있으면 일치 청크 점수 ↑
+        time_intent = _extract_time_intent(query)
+        if time_intent["year"] or time_intent["months"]:
+            self._apply_time_boost(reranked, time_intent)
+
         reranked = [d for d in reranked if d.get("rerank_score", 0) >= self.score_threshold]
         if not reranked:
             return []
@@ -115,7 +137,14 @@ class HybridRetriever:
         query: str,
         source_type_filter: str | None = None,
     ) -> list[dict]:
-        """1단계: 벡터 + BM25 + RRF로 광범위한 후보 수집 (임베딩과 BM25 병렬 실행)."""
+        """1단계: 벡터 + BM25 + RRF로 광범위한 후보 수집 (임베딩과 BM25 병렬 실행).
+
+        질의에 명시 year(예: "2026년")이 있으면 vector/BM25 검색 모두에 year 필터 적용.
+        후보 풀이 해당 연도 docs로 좁아져 짧은 doc도 안 밀려남.
+        """
+        time_intent = _extract_time_intent(query)
+        year_filter = time_intent.get("year")
+
         query_embedding, bm25_results = await asyncio.gather(
             self.embeddings.embed(query, task_type="RETRIEVAL_QUERY"),
             asyncio.to_thread(
@@ -123,6 +152,7 @@ class HybridRetriever:
                 query=query,
                 top_k=self.rerank_candidates,
                 source_type_filter=source_type_filter,
+                year_filter=year_filter,
             ),
         )
 
@@ -130,6 +160,7 @@ class HybridRetriever:
             query_vector=query_embedding,
             top_k=self.rerank_candidates,
             source_type_filter=source_type_filter,
+            year_filter=year_filter,
         )
 
         for result in vector_results:
@@ -215,6 +246,32 @@ class HybridRetriever:
                 reranked = reranked[:top_n]
 
         return reranked
+
+    def _apply_time_boost(self, reranked: list[dict], time_intent: dict) -> None:
+        """청크의 year 또는 텍스트의 월이 query 의도와 일치하면 rerank_score 부스트.
+
+        부스트 후 점수 내림차순으로 reranked 리스트 in-place 재정렬.
+        - year 일치: score *= 2.5
+        - text에 target month 등장: score *= 1.8
+        - 둘 다 일치: 누적 곱 (2.5 * 1.8 = 4.5)
+        """
+        YEAR_BOOST = 2.5
+        MONTH_BOOST = 1.8
+        target_year = time_intent.get("year")
+        target_months = time_intent.get("months", [])
+        # 월 텍스트 매칭: 앞 자리에 다른 숫자가 없어야 함 (예: "12월" 안의 "2월" 오매칭 방지)
+        month_patterns = [re.compile(rf"(?<!\d){m}월") for m in target_months]
+
+        for d in reranked:
+            score = d.get("rerank_score", 0)
+            if target_year and d.get("year") == target_year:
+                score *= YEAR_BOOST
+            if target_months:
+                text = d.get("text", "")
+                if any(p.search(text) for p in month_patterns):
+                    score *= MONTH_BOOST
+            d["rerank_score"] = score
+        reranked.sort(key=lambda d: d.get("rerank_score", 0), reverse=True)
 
     def _expand_by_post(
         self,

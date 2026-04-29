@@ -75,6 +75,7 @@ class BM25Index:
         query: str,
         top_k: int = 10,
         source_type_filter: str | None = None,
+        year_filter: int | None = None,
     ) -> list[dict]:
         """Search using BM25 scoring."""
         if self.bm25 is None:
@@ -90,6 +91,8 @@ class BM25Index:
                 continue
             meta = self.chunk_metadata[idx]
             if source_type_filter and meta["source_type"] != source_type_filter:
+                continue
+            if year_filter is not None and meta.get("year") != year_filter:
                 continue
             results.append(
                 {

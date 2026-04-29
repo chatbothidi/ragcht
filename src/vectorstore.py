@@ -70,6 +70,8 @@ class VectorStore:
                     data["year"] = meta["year"]
                 if meta.get("attachments"):
                     data["attachments"] = meta["attachments"]
+                if meta.get("url"):
+                    data["url"] = meta["url"]
 
             batch.set(doc_ref, data)
             batch_count += 1
@@ -91,11 +93,14 @@ class VectorStore:
         query_vector: list[float],
         top_k: int = 10,
         source_type_filter: str | None = None,
+        year_filter: int | None = None,
     ) -> list[dict]:
         """Firestore find_nearest를 통한 KNN 검색. id, score, 청크 필드를 가진 dict 리스트 반환."""
         q = self._collection()
         if source_type_filter:
             q = q.where(filter=FieldFilter("source_type", "==", source_type_filter))
+        if year_filter is not None:
+            q = q.where(filter=FieldFilter("year", "==", year_filter))
 
         vq = q.find_nearest(
             vector_field="embedding",

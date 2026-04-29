@@ -345,7 +345,7 @@ async def _main_async(args):
     bm25 = BM25Index()
 
     # add/delete 전용 가속: 임베딩 Redis 캐시 + BM25 토큰 캐시 로드.
-    # full은 의도적으로 영향 안 받게 둠.
+    # full은 영향 X
     redis_client: Redis | None = None
     if (args.add or args.delete) and settings.redis_url:
         redis_client = Redis.from_url(settings.redis_url, decode_responses=True)
